@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40" fill="none">
+  <!-- Dark-theme variant: same shape, brighter fill so the icon stays
+       visible against the dark IDE chrome. -->
+  <rect x="2" y="2" width="36" height="36" rx="8" fill="#A78BFA"/>
+  <path d="M15 12 L29 20 L15 28 Z" fill="#1A1A1A"/>
+</svg>

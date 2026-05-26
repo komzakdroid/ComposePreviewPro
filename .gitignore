@@ -1,0 +1,30 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+*.ipr
+*.iws
+local.properties
+.DS_Store
+.kotlin/
+
+# IntelliJ Platform plugin dev artifacts
+**/idea-sandbox/
+**/intellijPlatform/
+
+# Smoke / IPC test outputs (regenerated each run)
+smoke-out/
+ipc-out/
+
+# OS / editor scratch
+*.swp
+*.swo
+*~
+.vscode/
+
+# Credentials — never commit
+.env
+.env.local
+*.pem
+*.key

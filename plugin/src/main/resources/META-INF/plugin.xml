@@ -1,0 +1,36 @@
+<idea-plugin>
+    <!-- id, name, vendor, description, change-notes, version, and
+         idea-version are populated by the
+         `intellijPlatform { pluginConfiguration { … } }` block in
+         build.gradle.kts. The Gradle plugin patches them into this file
+         at packaging time. Declaring them in both places causes a
+         warning ("element already defined"), so we keep ONLY the wiring
+         (depends + extensions) here. -->
+
+    <!-- Platform module gives us the basic IDE plugin API.
+         Kotlin plugin gives PSI access to @Composable functions in .kt files.
+         Java module is required transitively by Kotlin's PSI in current IDEs. -->
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.java</depends>
+    <depends>org.jetbrains.kotlin</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Line marker = the ▶ icon shown in the editor gutter beside every
+             @Composable function declaration. -->
+        <codeInsight.lineMarkerProvider
+            language="kotlin"
+            implementationClass="com.composepreviewpro.plugin.marker.ComposableLineMarkerProvider"/>
+
+        <!-- Right-side tool window that hosts the rendered preview panel. -->
+        <toolWindow
+            id="ComposePreview"
+            anchor="right"
+            secondary="false"
+            factoryClass="com.composepreviewpro.plugin.toolwindow.PreviewToolWindowFactory"/>
+
+        <!-- Project-scoped service: one PreviewService per opened project,
+             holds the active renderer process and the panel reference. -->
+        <projectService
+            serviceImplementation="com.composepreviewpro.plugin.service.PreviewService"/>
+    </extensions>
+</idea-plugin>

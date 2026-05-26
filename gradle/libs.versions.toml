@@ -1,0 +1,62 @@
+#
+# ComposePreviewPro — Gradle Version Catalog
+# Single source of truth. NEVER hardcode versions in build.gradle.kts.
+#
+
+[versions]
+# ─────────── Build tooling ───────────
+kotlin = "2.3.20"
+java = "21"
+
+# ─────────── Compose Multiplatform ───────────
+# Used by :renderer and :sample to host Compose Desktop UI off-device.
+composeMultiplatform = "1.10.3"
+# Material3 ships on its own cadence within the Compose Multiplatform repo.
+# 1.10.0-alpha05 matches the artifact currently published alongside 1.10.3.
+composeMaterial3 = "1.10.0-alpha05"
+
+# ─────────── KotlinX ───────────
+kotlinxSerialization = "1.9.0"
+kotlinxCoroutines = "1.10.2"
+
+# ObjectWeb ASM — bytecode parser used by the renderer to extract
+# Compose Compiler source-info strings from user class files. Compose
+# Multiplatform 1.10.3 emits the strings into bytecode but does not
+# expose them at runtime; we read them directly off disk instead.
+asm = "9.7"
+
+# ─────────── IntelliJ Platform Plugin ───────────
+# Gradle plugin that builds IDE plugins. Version 2.x is the rewrite
+# (post-2024) that replaced the old `org.jetbrains.intellij` plugin.
+intellijPlatform = "2.3.0"
+# Target IDE: IntelliJ IDEA Community 2024.3 LTS — Android Studio derives from
+# this base and remains compatible. sinceBuild = "243" matches 2024.3.x.
+intellijTarget = "2024.3"
+
+[libraries]
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+kotlinx-coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "kotlinxCoroutines" }
+kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "kotlin" }
+
+# Compose Multiplatform — explicit deps. The compose-plugin DSL accessors
+# for material3 and ui-test were deprecated in 1.10 in favour of direct
+# dependency notation. The multiplatform .module file resolves to the
+# correct desktop/android/native variant automatically based on the
+# consuming target.
+compose-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "composeMaterial3" }
+compose-ui-test = { module = "org.jetbrains.compose.ui:ui-test", version.ref = "composeMultiplatform" }
+# ui-tooling-data exposes `asTree()` and `Group`/`SourceLocation` — used by
+# the renderer's inspector to map rendered bounds back to source positions.
+compose-ui-tooling-data = { module = "org.jetbrains.compose.ui:ui-tooling-data", version.ref = "composeMultiplatform" }
+
+# ASM bytecode parsing — renderer-side only.
+asm-core = { module = "org.ow2.asm:asm", version.ref = "asm" }
+asm-tree = { module = "org.ow2.asm:asm-tree", version.ref = "asm" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "composeMultiplatform" }
+intellij-platform = { id = "org.jetbrains.intellij.platform", version.ref = "intellijPlatform" }
