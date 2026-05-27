@@ -84,7 +84,10 @@ object MockEngine {
         // 8. Enums.
         enumMockOrNull(classifier)?.let { return it }
 
-        // 9. Data classes.
+        // 9. Sealed classes / interfaces — pick the simplest subclass.
+        sealedMockOrNull(classifier, context)?.let { return it }
+
+        // 10. Data classes.
         dataClassMockOrNull(classifier, context)?.let { return it }
 
         return MockResult.Unsupported(
@@ -322,6 +325,46 @@ object MockEngine {
         // Pick the first declared constant — deterministic, visible-by-
         // default behaviour. Tests and screenshots compare reliably.
         return MockResult.Success(constants[0])
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  Sealed hierarchy mocking
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * For a sealed class/interface, pick the cheapest valid instance
+     * we can produce:
+     *
+     *   1. Any subclass that's a Kotlin `object` (singleton — zero cost).
+     *   2. Any non-sealed subclass that we can mock as a data class.
+     *   3. Recursively dive into nested sealed subclasses.
+     *
+     * This handles the common "result wrapper" pattern (`Result.Success`,
+     * `Result.Failure`, `Result.Loading`) without forcing the user to
+     * supply an override — Loading/empty is usually the right preview.
+     */
+    private fun sealedMockOrNull(classifier: KClass<*>, context: MockContext): MockResult? {
+        if (!classifier.isSealed) return null
+        val subs = classifier.sealedSubclasses
+        if (subs.isEmpty()) return null
+
+        // (1) Prefer objects — no construction overhead.
+        for (sub in subs) {
+            sub.objectInstance?.let { return MockResult.Success(it) }
+        }
+        // (2) Then non-sealed concrete subclasses.
+        for (sub in subs) {
+            if (sub.isSealed) continue
+            val res = mock(sub.starProjectedType, context.child(null))
+            if (res is MockResult.Success) return res
+        }
+        // (3) Recurse into nested sealed children.
+        for (sub in subs) {
+            if (!sub.isSealed) continue
+            val res = mock(sub.starProjectedType, context.child(null))
+            if (res is MockResult.Success) return res
+        }
+        return null
     }
 
     // ─────────────────────────────────────────────────────────────

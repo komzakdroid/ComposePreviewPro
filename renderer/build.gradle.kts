@@ -40,6 +40,20 @@ dependencies {
     // ASM for off-line bytecode parsing of Compose source-info strings.
     implementation(libs.asm.core)
     implementation(libs.asm.tree)
+
+    // Mockito 5 (inline mock maker — default since 5.0.0) is what
+    // synthesises the Android Context graph at runtime for KMP
+    // composables whose only target is `androidMain`. Plain ByteBuddy
+    // subclass cannot work here because `android.content.res
+    // .AssetManager` is declared `final` and Compose Resources's
+    // preview reader path goes through `Context.assets.open(...)`.
+    // Mockito's inline mock maker uses bytecode redefinition (via
+    // ByteBuddy + JVMTI agent under the hood) to intercept method
+    // dispatch on final classes — which is exactly what we need.
+    // The renderer already opts into agent loading via
+    // `-XX:+EnableDynamicAgentLoading` so Mockito's agent attaches
+    // cleanly.
+    implementation("org.mockito:mockito-core:5.14.2")
 }
 
 application {
@@ -65,6 +79,20 @@ tasks.register<JavaExec>("smokeTest") {
     dependsOn(":sample:classes")
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.composepreviewpro.renderer.SmokeTestKt")
+    workingDir = rootDir
+    standardOutput = System.out
+    errorOutput = System.err
+}
+
+// Comprehensive test of the type-mocking cascade (MockEngine →
+// ComposableLambdaSynth → ComposeTypeMocks → AdvancedTypeMocks).
+// Catches regressions in any single layer plus integration paths.
+//   ./gradlew :renderer:typeMockTest
+tasks.register<JavaExec>("typeMockTest") {
+    group = "verification"
+    description = "Exercise every type-mocking layer with positive and negative cases"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.composepreviewpro.renderer.TypeMockTestKt")
     workingDir = rootDir
     standardOutput = System.out
     errorOutput = System.err

@@ -7,9 +7,11 @@ import com.composepreviewpro.ipc.RedefineClasses
 import com.composepreviewpro.ipc.RenderRequest
 import com.composepreviewpro.ipc.RenderResult
 import com.composepreviewpro.ipc.RendererSubprocess
+import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.thisLogger
+import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.project.Project
 import java.io.File
 
@@ -159,6 +161,24 @@ class RendererProcess(private val project: Project) : Disposable {
         return sub
     }
 
+    /**
+     * Search order, most-specific first:
+     *
+     *   1. Explicit override — system property or env var (developer
+     *      tooling, CI, custom installs).
+     *   2. **The renderer bundled inside this plugin's install directory.**
+     *      For production-installed plugins, IntelliJ reports the on-disk
+     *      directory via [PluginManagerCore.getPlugin(...).pluginPath].
+     *      We append `/renderer/bin/renderer` to it — that path is
+     *      populated at packaging time by build.gradle.kts's
+     *      `prepareSandbox` customisation.
+     *   3. Dev locations relative to `user.dir` — for running an
+     *      unpackaged plugin directly out of the source tree.
+     *
+     * The first match wins. If none exists, [getOrCreateSubprocess]
+     * throws with a self-describing error so the user immediately knows
+     * what's missing.
+     */
     private fun resolveLauncher(): File? {
         val candidates = mutableListOf<File>()
 
@@ -168,11 +188,56 @@ class RendererProcess(private val project: Project) : Disposable {
         System.getenv("COMPOSE_PREVIEW_RENDERER_HOME")?.let {
             candidates += File(it, "bin/renderer")
         }
+
+        // Plugin install directory — the production case.
+        pluginInstallDir()?.let { dir ->
+            candidates += File(dir, "renderer/bin/renderer")
+        }
+
         // Common dev locations relative to user.dir.
         val cwd = File(System.getProperty("user.dir"))
         candidates += File(cwd, "renderer/build/install/renderer/bin/renderer")
         candidates += File(cwd, "../ComposePreviewPro/renderer/build/install/renderer/bin/renderer")
 
-        return candidates.firstOrNull { it.exists() && it.canExecute() }
+        thisLogger().info("[ComposePreview] renderer launcher candidates:\n  " +
+            candidates.joinToString("\n  ") { "${it.absolutePath} exists=${it.exists()}" })
+
+        // First check: take any launcher that's already executable.
+        candidates.firstOrNull { it.exists() && it.canExecute() }?.let { return it }
+
+        // Fallback: a launcher was extracted from the plugin ZIP without
+        // the Unix execute bit (some ZIP extractors drop file attrs).
+        // If we find it sitting on disk read-only, restore the bit
+        // ourselves — owner-only is plenty since the IDE runs as the
+        // user. Without this rescue, the plugin reports "launcher not
+        // found" even though the file is right there.
+        candidates.firstOrNull { it.exists() }?.let { launcher ->
+            val ok = launcher.setExecutable(true, /* ownerOnly = */ false)
+            thisLogger().warn(
+                "[ComposePreview] launcher ${launcher.absolutePath} was not executable; " +
+                    "setExecutable=true returned $ok"
+            )
+            if (launcher.canExecute()) return launcher
+        }
+        return null
+    }
+
+    /**
+     * Resolve the on-disk directory IntelliJ unpacked this plugin into.
+     * For sandbox runs (./gradlew :plugin:runIde) that's
+     * `plugin/build/idea-sandbox/.../plugins-prepared/<pluginName>/`.
+     * For a real user install it's somewhere under
+     * `~/Library/Application Support/<IDE>/plugins/<pluginName>/` on
+     * macOS, or the platform-equivalent path. Returns null only if the
+     * plugin descriptor cannot be found (shouldn't happen at runtime).
+     */
+    private fun pluginInstallDir(): File? {
+        val descriptor = PluginManagerCore.getPlugin(PluginId.getId(PLUGIN_ID))
+        val path = descriptor?.pluginPath ?: return null
+        return path.toFile()
+    }
+
+    private companion object {
+        const val PLUGIN_ID = "com.composepreviewpro"
     }
 }

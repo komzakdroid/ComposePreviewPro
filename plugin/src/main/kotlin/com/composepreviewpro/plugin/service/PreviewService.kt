@@ -21,6 +21,7 @@ import com.composepreviewpro.plugin.toolwindow.PreviewPanel
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.thisLogger
+import com.intellij.openapi.externalSystem.util.ExternalSystemApiUtil
 import com.intellij.openapi.module.Module
 import com.intellij.openapi.module.ModuleManager
 import com.intellij.openapi.module.ModuleUtilCore
@@ -127,8 +128,19 @@ class PreviewService(private val project: Project) {
     /** Initial render path: called when the user clicks the gutter icon. */
     fun renderComposable(function: KtNamedFunction, fqn: String) {
         thisLogger().info("[ComposePreview] renderComposable: $fqn")
-        val module = ModuleUtilCore.findModuleForPsiElement(function)
+        val sourceModule = ModuleUtilCore.findModuleForPsiElement(function)
             ?: return reportError("No module found for ${function.name}")
+        // For Kotlin Multiplatform projects, the user's @Composable often
+        // lives in a `commonMain` source set whose IntelliJ module produces
+        // metadata KLIBs, not JVM .class files. The renderer can only
+        // load JVM bytecode, so we redirect to a platform-specific
+        // sibling module (desktopMain → jvmMain → androidMain in
+        // preference order). For plain JVM/Android modules this is a no-op.
+        val module = resolveJvmRunnableModule(sourceModule)
+        if (module != sourceModule) {
+            thisLogger().info("[ComposePreview] redirecting ${sourceModule.name} → " +
+                "${module.name} for JVM-runnable classpath")
+        }
         val target = RenderTarget(fqn = fqn, moduleName = module.name)
         val targetChanged = lastTarget?.fqn != target.fqn
         lastTarget = target
@@ -142,19 +154,117 @@ class PreviewService(private val project: Project) {
     }
 
     /**
+     * If [sourceModule] is a Kotlin Multiplatform shared source set whose
+     * compile output is metadata-only (cannot be loaded by a JVM
+     * classloader), look up a sibling source-set module that compiles to
+     * JVM bytecode and return that instead.
+     *
+     * IntelliJ exposes one module per KMP source set, named
+     * `<gradlePath>.<sourceSet>` (e.g. `MultiTask.feature.timer.commonMain`).
+     * We rank siblings by JVM compatibility:
+     *
+     *   • Pure-JVM targets first — `desktopMain`, `jvmMain`,
+     *     `desktopAndAndroidMain`, `skikoMain`, anything ending in
+     *     `JvmMain` / `DesktopMain`. These compile @Composable code
+     *     against the JVM/Skiko flavors of Compose Multiplatform —
+     *     no Android Context needed, Compose Resources reads from the
+     *     classpath, **renderer works end-to-end**.
+     *
+     *   • `androidMain` only as a **last resort**, with a stern warning.
+     *     Android-compiled bytecode hard-references `androidx.compose
+     *     .ui.platform.LocalContext` and `org.jetbrains.compose.resources
+     *     .AndroidContextProviderKt`. The JVM renderer cannot synthesise
+     *     an `android.content.Context` (abstract class, not an
+     *     interface, can't be dynamic-proxied), so a composable that
+     *     uses `stringResource`, `painterResource`, or any other
+     *     Android-flavored Compose Multiplatform API will throw
+     *     `IllegalStateException: CompositionLocal LocalContext not
+     *     present` at render time. This fallback exists for composables
+     *     that don't touch any of those APIs.
+     *
+     * Returns the original module unchanged when no JVM-runnable
+     * sibling exists (rare: single-target K/Native, wasm-only modules,
+     * etc.).
+     */
+    private fun resolveJvmRunnableModule(sourceModule: Module): Module {
+        val name = sourceModule.name
+        // ONLY `.commonMain` is a true KMP shared-source-set suffix. The
+        // `.main` and `.commonTest` suffixes match plain Android Gradle
+        // modules too (the "main" source set has no JVM ↔ Android split),
+        // and triggering the KMP redirect for those was a false positive
+        // that broke pure-Android projects like Now In Android by
+        // logging a misleading "no JVM-runnable sibling" warning.
+        if (!name.endsWith(".commonMain")) return sourceModule
+        val baseName = name.removeSuffix(".commonMain")
+        val moduleManager = ModuleManager.getInstance(project)
+        val allModules = moduleManager.modules
+        val siblings = allModules.filter { it.name.startsWith("$baseName.") }
+        thisLogger().info(
+            "[ComposePreview] KMP sibling modules of $baseName: " +
+                siblings.joinToString { it.name.removePrefix("$baseName.") }
+        )
+
+        // Tier A — pure JVM targets, ordered by exactness then commonality.
+        val tierA = listOf(
+            "$baseName.desktopMain",
+            "$baseName.jvmMain",
+            "$baseName.desktopAndAndroidMain",
+            "$baseName.skikoMain",
+            "$baseName.nonAndroidMain",
+        )
+        tierA.forEach { exact ->
+            moduleManager.findModuleByName(exact)?.let {
+                thisLogger().info("[ComposePreview] picked JVM target: ${it.name}")
+                return it
+            }
+        }
+        // Fuzzy match — anything containing "desktop" / "jvm" / "skiko" but
+        // NOT "android" / "ios" / "native" / "wasm" / "js".
+        val jvmHints = listOf("desktop", "jvm", "skiko")
+        val nonJvmHints = listOf("android", "ios", "native", "wasm", "js", "test")
+        siblings
+            .firstOrNull { s ->
+                val short = s.name.removePrefix("$baseName.").lowercase()
+                jvmHints.any { short.contains(it) } &&
+                    nonJvmHints.none { short.contains(it) }
+            }?.let {
+                thisLogger().info("[ComposePreview] fuzzy-picked JVM target: ${it.name}")
+                return it
+            }
+
+        // Tier B — Android fallback, with audible warning.
+        moduleManager.findModuleByName("$baseName.androidMain")?.let {
+            thisLogger().warn(
+                "[ComposePreview] no pure-JVM target found for $baseName — falling back " +
+                    "to androidMain. Composables using stringResource / Compose Resources / " +
+                    "LocalContext will fail with 'LocalContext not present'. Add a " +
+                    "`desktopMain` source set to your module for full preview support."
+            )
+            return it
+        }
+        thisLogger().warn(
+            "[ComposePreview] no JVM-runnable sibling found for $name; rendering will " +
+                "likely fail because the commonMain compile output is metadata-only."
+        )
+        return sourceModule
+    }
+
+    /**
      * Build a [RenderRequest] for [target] using the current classpath.
      * Exposed for [HotReloadCoordinator] to embed inside a
      * [RedefineClasses] payload.
      */
     fun buildRenderRequest(target: RenderTarget): RenderRequest? {
         val module = target.resolveModule(project) ?: return null
-        val classpathPaths = OrderEnumerator.orderEntries(module)
+        val baseClasspath = OrderEnumerator.orderEntries(module)
             .recursively()
             .productionOnly()
             .pathsList
             .pathList
             .map { it.toString() }
-        if (classpathPaths.isEmpty()) return null
+        if (baseClasspath.isEmpty()) return null
+        val composeResourceRoots = findComposeResourceRoots(target).map { it.absolutePath }
+        val classpathPaths = (baseClasspath + composeResourceRoots).distinct()
         return RenderRequest(
             requestId = UUID.randomUUID().toString(),
             target = ComposableId(target.fqn),
@@ -495,6 +605,349 @@ class PreviewService(private val project: Project) {
         return roots
     }
 
+    /**
+     * Walk every transitive module and collect every plausible compiled-
+     * classes directory, regardless of build system. This is what makes
+     * the difference between "OrderEnumerator gave us 111 entries"
+     * (which on a multi-module AGP project is mostly Compose dependency
+     * caches) and "the actual ButtonKt.class file is reachable".
+     *
+     * Probed layouts, in roughly the order of popularity:
+     *
+     *   • `build/classes/kotlin/main`               — KMP/JVM modules
+     *   • `build/classes/java/main`                 — pure-JVM modules
+     *   • `build/classes/kotlin/<sourceSet>`        — KMP source-set output
+     *   • `build/tmp/kotlin-classes/<variant>`      — AGP+KGP Kotlin out
+     *   • `build/intermediates/javac/<variant>/classes`         — AGP Java out
+     *   • `build/intermediates/runtime_library_classes_dir/...` — AGP AAR
+     *   • `build/intermediates/runtime_library_classes_jar/<v>/classes.jar`
+     *
+     * Each candidate must exist AND contain at least one `.class` file
+     * or be a `.jar` — empty/stale directories are skipped so we don't
+     * bloat the renderer's classpath with dead paths.
+     */
+    private fun collectClassOutputRoots(target: RenderTarget, targetFqn: String = ""): List<File> {
+        val module = target.resolveModule(project) ?: return emptyList()
+        val mm = ModuleManager.getInstance(project)
+
+        // Step 1: gather ALL modules we care about. Start with the
+        // source module, add its source-set parent (e.g. ".main" → ""
+        // sibling), and walk transitive module deps. For each module
+        // we'll inspect content roots AND name-parent siblings —
+        // covers the IntelliJ split where a Gradle module like
+        // `:core:designsystem` becomes multiple IDE modules
+        // (`nowinandroid.core.designsystem`, `nowinandroid.core
+        // .designsystem.main`, `…unitTest`, …).
+        val modules = mutableSetOf<Module>()
+        modules.add(module)
+        addNameParent(mm, module.name, modules)
+        ModuleRootManager.getInstance(module).orderEntries()
+            .recursively()
+            .forEachModule { m ->
+                modules.add(m)
+                addNameParent(mm, m.name, modules)
+                true
+            }
+
+        // Step 2: derive Gradle module directories. The IntelliJ Android
+        // model registers source-set modules whose content roots are
+        // SOURCE dirs (e.g. `core/designsystem/src/main`) — NOT the
+        // Gradle module root that holds `build/`. We walk up from each
+        // content root until we find a `build.gradle{.kts}` file; that
+        // marks the real Gradle module dir.
+        val gradleModuleDirs = mutableSetOf<File>()
+        for (m in modules) {
+            for (contentRoot in ModuleRootManager.getInstance(m).contentRoots) {
+                val crFile = contentRoot.toNioPath().toFile()
+                gradleModuleDirs.add(crFile)  // try as-is (covers gradle-module modules)
+                findGradleModuleRoot(crFile)?.let { gradleModuleDirs.add(it) }
+            }
+            // ExternalSystemApiUtil sometimes carries an external
+            // project path even when IDE content roots are pure source
+            // dirs — Android Studio sets it via the AGP importer.
+            ExternalSystemApiUtil.getExternalProjectPath(m)
+                ?.let { File(it) }
+                ?.takeIf { it.isDirectory }
+                ?.let { gradleModuleDirs.add(it) }
+        }
+
+        val out = mutableListOf<File>()
+        val seen = mutableSetOf<String>()
+
+        fun accept(f: File) {
+            if (!f.exists()) return
+            val hasOutput = when {
+                f.isFile && f.name.endsWith(".jar") -> true
+                f.isDirectory -> f.walkTopDown().take(2000)
+                    .any { it.isFile && (it.name.endsWith(".class") || it.name.endsWith(".jar")) }
+                else -> false
+            }
+            if (!hasOutput) return
+            if (seen.add(f.absolutePath)) out += f
+        }
+
+        // Step 3: for each Gradle module dir, probe every known layout.
+        for (moduleDir in gradleModuleDirs) {
+            val buildDir = File(moduleDir, "build")
+            if (!buildDir.isDirectory) continue
+            // KMP / JVM Kotlin outputs.
+            File(buildDir, "classes/kotlin").listFiles()?.forEach(::accept)
+            File(buildDir, "classes/java").listFiles()?.forEach(::accept)
+            // AGP Kotlin (variant subdirs).
+            File(buildDir, "tmp/kotlin-classes").listFiles()?.forEach(::accept)
+            // AGP Java — variant/classes pattern.
+            File(buildDir, "intermediates/javac").listFiles()?.forEach { variant ->
+                accept(File(variant, "classes"))
+            }
+            // AGP merged library outputs (used by AAR consumers).
+            File(buildDir, "intermediates/runtime_library_classes_dir").listFiles()?.forEach(::accept)
+            File(buildDir, "intermediates/runtime_library_classes_jar").listFiles()?.forEach { variant ->
+                accept(File(variant, "classes.jar"))
+            }
+            // Some AGP versions output to `intermediates/compile_library_classes_jar`.
+            File(buildDir, "intermediates/compile_library_classes_jar").listFiles()?.forEach { variant ->
+                accept(File(variant, "classes.jar"))
+            }
+            // AGP 8.x+ "built-in kotlinc" — emits to
+            //   intermediates/built_in_kotlinc/<variant>/compile<Variant>Kotlin/classes/
+            // The path has TWO extra hops (variant + task subdir) below
+            // built_in_kotlinc — this was the layout that masked Now In
+            // Android's class output from every other probe.
+            File(buildDir, "intermediates/built_in_kotlinc").listFiles()?.forEach { variant ->
+                variant.listFiles()?.forEach { task ->
+                    accept(File(task, "classes"))
+                }
+            }
+        }
+
+        // Step 3.5 — **Android intermediate JARs** (R.jar etc.).
+        //
+        // AGP generates R.class files PER CONSUMING MODULE/APP from
+        // merged resources. They live in well-known intermediate
+        // paths but are NOT part of `productionOnly()` classpath or
+        // any per-module `build/classes/...` directory. Without them,
+        // any code that references `androidx.core.R$id`,
+        // `androidx.lifecycle.R$id`, or another library's R-generated
+        // identifier hits a `NoClassDefFoundError` at preview time —
+        // exactly the symptom that surfaced when `WindowInsets
+        // .statusBars` initialised `ViewCompat`.
+        //
+        // We pick these up project-wide because the user's previewed
+        // module rarely owns the merged R; it's typically generated
+        // by the application module (`:androidApp`) which we'd never
+        // reach via `OrderEnumerator` walking from a feature module.
+        val projectBase = project.basePath?.let(::File)
+        if (projectBase != null && projectBase.isDirectory) {
+            val androidJarPatterns = listOf(
+                "/intermediates/compile_r_class_jar/",
+                "/intermediates/compile_and_runtime_r_class_jar/",
+                "/intermediates/runtime_library_classes_jar/",
+                "/intermediates/compile_library_classes_jar/",
+                "/intermediates/aar_main_jar/",
+                "/intermediates/merged_java_res/",
+            )
+            projectBase.walkTopDown()
+                .onEnter { dir ->
+                    val name = dir.name
+                    name != "node_modules" &&
+                        !name.startsWith(".") &&
+                        !dir.absolutePath.contains("/ComposePreviewPro/")
+                }
+                .filter { it.isFile && it.name.endsWith(".jar") }
+                .filter { jar ->
+                    val abs = jar.absolutePath
+                    androidJarPatterns.any { abs.contains(it) }
+                }
+                .take(1000)
+                .forEach(::accept)
+        }
+
+        // Step 4 — **bulletproof FQN search**.
+        //
+        // No matter how exotic the build layout, the user's compiled
+        // `.class` file lives SOMEWHERE under the project tree once
+        // they've built. Convert the requested FQN to its expected
+        // path-suffix, then walk every `build/` directory looking for
+        // a `.class` file whose absolute path ends with that suffix.
+        // Each match yields a classpath ROOT (the part of the path
+        // BEFORE the package), and we add it. This loop runs even when
+        // earlier probes succeeded — Step 4 is additive, not a fallback,
+        // because the user's target might live in an AGP layout the
+        // probes don't know about while OTHER files (dependency
+        // jars, build-logic classes) come from the standard paths.
+        val classSuffix = if (targetFqn.isNotEmpty()) {
+            targetFqn.replace('.', '/') + ".class"
+        } else {
+            null
+        }
+        if (classSuffix != null) {
+            val projectBase = project.basePath?.let(::File)
+            if (projectBase != null && projectBase.isDirectory) {
+                val matches = findClassByFqn(projectBase, classSuffix)
+                thisLogger().info(
+                    "[ComposePreview] FQN-search '$classSuffix' → ${matches.size} matches"
+                )
+                matches.forEach(::accept)
+            }
+        }
+
+        thisLogger().info(
+            "[ComposePreview] class-output roots discovered: ${out.size} " +
+                "(modules=${modules.size}, gradleDirs=${gradleModuleDirs.size}; " +
+                "first=${out.take(3).map { it.absolutePath }})"
+        )
+        return out
+    }
+
+    /**
+     * Walk every `build/` directory under [projectBase] looking for
+     * a `.class` file whose path ends with [classSuffix] (e.g.
+     * `com/google/.../ButtonKt.class`). Return the **classpath roots**
+     * (i.e. the absolute prefix BEFORE the package portion). Multiple
+     * matches are possible — a multi-variant Android module can have
+     * the same class compiled in `demoDebug/`, `prodRelease/`, etc.
+     * — and they're all added so the URLClassLoader will pick whichever
+     * one happens to be valid for the active variant.
+     *
+     * Performance: lazy `walkTopDown()` with an early exit per build
+     * directory. On a 60-module project this still runs in well under
+     * a second because most `build/` trees are shallow and we stop
+     * collecting after 5 matches per tree.
+     */
+    private fun findClassByFqn(projectBase: File, classSuffix: String): List<File> {
+        val result = mutableListOf<File>()
+        val seen = mutableSetOf<String>()
+        // Find every `build` directory shallowly — they're the only
+        // places compiled `.class` files live.
+        val buildDirs = projectBase.walkTopDown()
+            .filter { it.isDirectory && it.name == "build" }
+            // Skip our own plugin's build dir to avoid noise.
+            .filterNot { it.absolutePath.contains("/ComposePreviewPro/") }
+            .toList()
+        for (build in buildDirs) {
+            val hits = build.walkTopDown()
+                .filter { it.isFile && it.absolutePath.endsWith(classSuffix) }
+                .take(5)
+                .toList()
+            for (hit in hits) {
+                // The classpath root is the absolute path with the
+                // classSuffix portion stripped. The result is the
+                // directory `.class` files live UNDER (`/foo/bar/`
+                // for a class at `/foo/bar/com/google/.../X.class`).
+                val rootPath = hit.absolutePath.removeSuffix("/$classSuffix")
+                if (rootPath == hit.absolutePath) continue  // suffix didn't match
+                val root = File(rootPath)
+                if (root.isDirectory && seen.add(root.absolutePath)) {
+                    result += root
+                }
+            }
+        }
+        return result
+    }
+
+    /**
+     * IntelliJ's Android module importer creates source-set modules
+     * (`<gradlePath>.main`, `<gradlePath>.unitTest`) and a parent
+     * module (`<gradlePath>`). Class outputs live under the PARENT's
+     * content root — so when we see a `.main`/`.unitTest`/`.commonMain`-
+     * suffixed module, we ALSO want to look at its name-parent so we
+     * can walk that module's content root → Gradle module dir →
+     * `build/` outputs.
+     */
+    private fun addNameParent(mm: ModuleManager, name: String, into: MutableSet<Module>) {
+        // Trim known source-set suffixes.
+        val suffixes = listOf(
+            ".main", ".unitTest", ".androidTest",
+            ".commonMain", ".commonTest",
+            ".androidMain", ".desktopMain", ".jvmMain",
+            ".iosMain", ".nativeMain", ".appleMain",
+        )
+        val stripped = suffixes.firstOrNull { name.endsWith(it) }
+            ?.let { name.removeSuffix(it) }
+            ?: return
+        mm.findModuleByName(stripped)?.let(into::add)
+    }
+
+    /**
+     * Walk up from [from] until we find a directory containing a
+     * `build.gradle{.kts}` file — that's the Gradle module root.
+     * Returns `null` if we hit the filesystem root first.
+     */
+    private fun findGradleModuleRoot(from: File): File? {
+        var dir: File? = from
+        for (i in 0 until 10) {  // hard cap — never walk beyond 10 levels
+            if (dir == null) return null
+            if (File(dir, "build.gradle.kts").exists() || File(dir, "build.gradle").exists()) {
+                return dir
+            }
+            dir = dir.parentFile
+        }
+        return null
+    }
+
+    /**
+     * Find every directory under the user's transitive module set that
+     * contains a `composeResources/...` subtree. These directories are
+     * NOT visible through [OrderEnumerator.productionOnly] because
+     * Compose Multiplatform Resources keeps its `.cvr` binaries in
+     * Gradle-task output folders (e.g. `build/generated/compose/...`
+     * and `build/intermediates/library_assets/...`) — separate from the
+     * compiled classes. Without these on the renderer's classpath, the
+     * `AssetManager.open(path)` stub returns null and Compose Resources
+     * fails to decode (the "Invalid Base64 symbol ' '" symptom).
+     *
+     * We probe four well-known generated locations under each module's
+     * content roots; whichever exist get added. Multi-module projects
+     * (e.g. MultiTask with 20+ feature/core modules) light up all the
+     * paths simultaneously, so a composable that consumes resources
+     * from a *different* module than the one being previewed still
+     * resolves.
+     */
+    fun findComposeResourceRoots(target: RenderTarget): List<File> {
+        val roots = mutableListOf<File>()
+        val seen = mutableSetOf<String>()
+        fun add(dir: File) {
+            if (!dir.isDirectory) return
+            val abs = dir.absolutePath
+            if (seen.add(abs)) roots += dir
+        }
+
+        // **Aggressive brute-force scan of the whole project tree.**
+        // Why we don't hand-roll path probes anymore: Compose
+        // Multiplatform and AGP have shipped several different output
+        // layouts for `.cvr` resources (preparedResources, library_assets,
+        // androidComposeResources, …). Each minor version shifts the
+        // path one level. The bug pattern of "ship probe N, miss layout
+        // N+1" is structural. Walking the project tree for any
+        // `composeResources/` directory and using its PARENT as a
+        // classpath root works regardless of layout — the renderer's
+        // `ClassLoader.getResourceAsStream("composeResources/<id>/...")`
+        // resolves whichever roots we add.
+        //
+        // Performance: bounded walk that skips obvious irrelevant dirs
+        // (hidden, node_modules, our own plugin) and caps total finds.
+        // On a 60-module project this completes in well under a second.
+        val projectBase = project.basePath?.let(::File)
+        if (projectBase != null && projectBase.isDirectory) {
+            projectBase.walkTopDown()
+                .onEnter { dir ->
+                    val name = dir.name
+                    name != "node_modules" &&
+                        !name.startsWith(".") &&
+                        !dir.absolutePath.contains("/ComposePreviewPro/")
+                }
+                .filter { it.isDirectory && it.name == "composeResources" }
+                .take(500)  // cap total to keep memory bounded
+                .forEach { dir -> dir.parentFile?.let(::add) }
+        }
+        thisLogger().info(
+            "[ComposePreview] compose-resource roots discovered: ${roots.size} " +
+                "(brute-force scan under ${projectBase?.absolutePath}; " +
+                "samples=${roots.take(3).map { it.absolutePath }})"
+        )
+        return roots
+    }
+
     private fun findGradleClassesDir(module: Module): File? {
         // Last-resort: derive from any content root by walking to its
         // closest ancestor `build/classes` directory.
@@ -633,12 +1086,30 @@ class PreviewService(private val project: Project) {
         val module = target.resolveModule(project)
             ?: return reportError("Module ${target.moduleName} not found")
 
-        val classpathPaths = OrderEnumerator.orderEntries(module)
+        val baseClasspath = OrderEnumerator.orderEntries(module)
             .recursively()
             .productionOnly()
             .pathsList
             .pathList
             .map { it.toString() }
+
+        // OrderEnumerator returns dependency JARs and SOMETIMES the
+        // module's own class outputs — but for Android Library modules,
+        // the user's own `core/designsystem/build/intermediates/javac/.../
+        // classes/...` directories are routinely missing. We probe them
+        // explicitly via moduleClassOutputRoots+AGP-specific paths so
+        // the renderer can actually find ButtonKt.class.
+        val classOutputRoots = collectClassOutputRoots(target, target.fqn).map { it.absolutePath }
+
+        // Augment with Compose Multiplatform Resources output directories.
+        // OrderEnumerator only returns class outputs and JAR deps, but
+        // the renderer ALSO needs the .cvr binary files that hold the
+        // actual string/asset payloads. Without these, AssetManager
+        // .open(...) on an Android-compiled composable returns null and
+        // Compose Resources crashes decoding Base64 off an empty stream.
+        val composeResourceRoots = findComposeResourceRoots(target).map { it.absolutePath }
+
+        val classpathPaths = (baseClasspath + classOutputRoots + composeResourceRoots).distinct()
 
         if (classpathPaths.isEmpty()) {
             return reportError(
@@ -648,7 +1119,9 @@ class PreviewService(private val project: Project) {
         }
 
         thisLogger().info("[ComposePreview] executeRender: ${target.fqn}, " +
-            "classpath entries=${classpathPaths.size}")
+            "classpath entries=${classpathPaths.size} " +
+            "(base=${baseClasspath.size}, +class-output=${classOutputRoots.size}, " +
+            "+compose-resources=${composeResourceRoots.size})")
 
         revealToolWindow()
         panel?.showLoading(target.fqn)
@@ -722,12 +1195,14 @@ class PreviewService(private val project: Project) {
     private fun executeMultiFrameRender(target: RenderTarget, freshClassLoader: Boolean) {
         val module = target.resolveModule(project)
             ?: return reportError("Module ${target.moduleName} not found")
-        val classpathPaths = OrderEnumerator.orderEntries(module)
+        val baseClasspath = OrderEnumerator.orderEntries(module)
             .recursively()
             .productionOnly()
             .pathsList
             .pathList
             .map { it.toString() }
+        val composeResourceRoots = findComposeResourceRoots(target).map { it.absolutePath }
+        val classpathPaths = (baseClasspath + composeResourceRoots).distinct()
         if (classpathPaths.isEmpty()) return reportError("Module ${module.name} has no classpath")
 
         revealToolWindow()

@@ -12,6 +12,7 @@ local.properties
 # IntelliJ Platform plugin dev artifacts
 **/idea-sandbox/
 **/intellijPlatform/
+.intellijPlatform/
 
 # Smoke / IPC test outputs (regenerated each run)
 smoke-out/

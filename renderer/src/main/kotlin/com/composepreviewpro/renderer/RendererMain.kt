@@ -113,7 +113,11 @@ private fun performRender(
                     heightPx = req.size.heightPx,
                     theme = req.theme,
                 )
-                val base64 = session.mount(fn, bind.args)
+                // Hand the classpath roots to the session so the
+                // synthetic AssetManager (Android scenarios) can index
+                // compose-resource files outside the URLClassLoader's
+                // direct knowledge.
+                val base64 = session.mount(fn, bind.args, req.classpath.paths)
                 // Parse user classpath ONCE per (classpath signature)
                 // and cache; this is the bridge that lets us pair each
                 // composition slot key with its source file:line.

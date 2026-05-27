@@ -45,7 +45,29 @@ class ComposableResolver(
     fun resolve(id: ComposableId): KFunction<*>? {
         val cls = try {
             classLoader.loadClass(id.className)
-        } catch (_: ClassNotFoundException) {
+        } catch (e: ClassNotFoundException) {
+            // Emit detailed diagnostics so the IDE side can show the user
+            // which class file we were looking for and whether anything
+            // close to it exists on the classpath — speeds up debugging
+            // of "TARGET_NOT_FOUND" for non-trivial KMP / Gradle layouts.
+            System.err.println(
+                "[ComposableResolver] class ${id.className} not on classpath. " +
+                    "Classpath entries=${classpath.paths.size}:"
+            )
+            classpath.paths.take(40).forEach { System.err.println("  $it") }
+            if (classpath.paths.size > 40) {
+                System.err.println("  ... (${classpath.paths.size - 40} more)")
+            }
+            // Look for a class file with the same simple name anywhere
+            // under the classpath roots so the IDE can suggest the
+            // closest module.
+            val expected = id.className.substringAfterLast('.') + ".class"
+            classpath.paths.asSequence()
+                .map { File(it) }
+                .filter { it.isDirectory }
+                .flatMap { dir -> dir.walkTopDown().filter { it.name == expected } }
+                .take(5)
+                .forEach { System.err.println("[ComposableResolver] near miss: ${it.absolutePath}") }
             return null
         }
 

@@ -84,6 +84,46 @@ tasks.named<JavaExec>("runIde") {
     })
 }
 
+// Bundle the renderer's full installDist tree INSIDE the packaged plugin
+// directory so that production installs (Settings → Install Plugin from
+// Disk…) include the subprocess launcher + every JAR it needs.
+//
+// Layout inside plugin.zip after this:
+//
+//   plugin/
+//     ├── lib/             ← IDE plugin JARs (existing)
+//     └── renderer/        ← bundled subprocess (NEW)
+//          ├── bin/renderer   (the launch script)
+//          └── lib/*.jar      (the renderer's classpath)
+//
+// At runtime, RendererProcess.resolveLauncher() consults
+// PluginManagerCore.getPlugin(...).pluginPath and looks here first —
+// works whether the plugin lives in the sandbox or the user's
+// production `~/Library/Application Support/<IDE>/plugins/` directory.
+tasks.named<Sync>("prepareSandbox") {
+    dependsOn(":renderer:installDist")
+    // The IntelliJ Platform Gradle Plugin's prepareSandbox installs the
+    // plugin under `<sandbox>/plugins/<project.name>/`. The same prefix
+    // is used inside plugin.zip, so we copy renderer/ alongside lib/
+    // under the same `plugin/` root. We hard-code `project.name` here
+    // (resolves to "plugin") because the property is reliably
+    // available at configuration time — the
+    // `intellijPlatform.pluginConfiguration.name` provider is not.
+    //
+    // The Unix execute bit on the renderer launch scripts MUST be
+    // preserved through the prepareSandbox copy AND the subsequent zip,
+    // otherwise the user hits "Permission denied" when the plugin tries
+    // to spawn the subprocess. We re-apply `0755` to the launchers
+    // here; RendererProcess.kt also calls setExecutable(true) at runtime
+    // as a final defense for ZIP extractors that drop Unix attrs.
+    from("${rootDir}/renderer/build/install/renderer") {
+        into("${project.name}/renderer")
+        filesMatching(listOf("bin/renderer", "bin/renderer.bat")) {
+            permissions { unix("755") }
+        }
+    }
+}
+
 intellijPlatform {
     // Headless IDE startup task we don't need for MVP. It launches the IDE
     // to extract Settings UI searchable strings — irrelevant because we
@@ -94,7 +134,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "com.composepreviewpro"
         name = "Compose Preview Pro"
-        version = "0.1.0"
+        version = "0.3.4"
 
         // Rich Marketplace description. Rendered as HTML on the listing
         // page (jetbrains.com/marketplace) — break paragraphs with <p>,
@@ -134,6 +174,48 @@ intellijPlatform {
         // in the "Updated" tab of the in-IDE Plugins screen. Keep it short
         // and user-facing; technical detail belongs in CHANGELOG.md.
         changeNotes = """
+            <h4>0.1.8 — Mockito inline mock maker for Android Context stub (final-class fix)</h4>
+            <ul>
+              <li>0.1.6/0.1.7 tried to build the Context stub with plain ByteBuddy subclassing, which crashed at <code>android.content.res.AssetManager</code> because that class is <code>final</code>. Switched to Mockito 5's inline mock maker, which uses JVMTI class redefinition to intercept methods on final classes — the AssetManager mock now works and Compose Resources' preview path can call <code>context.assets.open(path)</code> successfully (routed to <code>ClassLoader.getResourceAsStream</code>).</li>
+              <li>Added detailed diagnostic logging at every step of the stub creation so future failures surface immediately instead of bubbling up as a generic <code>LocalContext not present</code>.</li>
+            </ul>
+
+            <h4>0.1.6 — Synthetic Android Context for KMP projects with no desktop target</h4>
+            <ul>
+              <li><b>The big one:</b> the renderer now generates a runtime <code>android.content.Context</code> stub via ByteBuddy and provides it through <code>LocalContext</code>, letting Compose Multiplatform Resources (<code>stringResource</code>, <code>painterResource</code>) work even when the user's Gradle module has only an <code>androidMain</code> target. Asset reads route to the URLClassLoader, so resources packaged into the user's JARs (<code>composeResources/&lt;module&gt;/values/...</code>) load cleanly.</li>
+              <li>No-op for non-Android scenarios — non-existent <code>android.content.Context</code> on the classpath means we skip the stub entirely.</li>
+            </ul>
+
+            <h4>0.1.5 — Smarter KMP target ranking + user-friendly Android-only diagnostics</h4>
+            <ul>
+              <li>Module probing now considers many KMP target names (<code>desktopMain</code>, <code>jvmMain</code>, <code>desktopAndAndroidMain</code>, <code>skikoMain</code>, <code>nonAndroidMain</code>) plus fuzzy matching on <code>desktop</code>/<code>jvm</code>/<code>skiko</code> substrings. Hits sorted: pure-JVM first, Android as last resort with a logged warning.</li>
+              <li>If the only available target is <code>androidMain</code> and the composable uses Compose Resources, the renderer now emits an actionable error explaining how to add a <code>desktopMain</code> source set, instead of dumping a raw <code>CompositionLocal LocalContext not present</code> stack trace.</li>
+            </ul>
+
+            <h4>0.1.4 — Kotlin Multiplatform commonMain support</h4>
+            <ul>
+              <li>Composables in a KMP <code>commonMain</code> source set used to fail with <i>TARGET_NOT_FOUND</i> because the commonMain module's compile output is metadata KLIB, not JVM bytecode. The plugin now redirects to a sibling JVM target (<code>desktopMain</code> → <code>jvmMain</code> → <code>androidMain</code>) at render time and uses ITS classpath instead.</li>
+              <li>No-op for single-target JVM or Android-only projects.</li>
+            </ul>
+
+            <h4>0.1.3 — Renderer bundled inside the plugin (production-install fix)</h4>
+            <ul>
+              <li><b>Critical:</b> 0.1.0–0.1.2 only worked when launched from the source tree because the renderer subprocess (Compose Desktop host) wasn't packaged inside <code>plugin.zip</code>. Users who installed via "Install from Disk" hit <i>Renderer launcher not found</i>.</li>
+              <li>0.1.3 bundles the full renderer install (<code>bin/renderer</code> + all classpath JARs, ~40&nbsp;MB) inside the plugin's own install directory and resolves it via <code>PluginManagerCore.getPlugin(...).pluginPath</code>.</li>
+            </ul>
+
+            <h4>0.1.2 — Wider gutter-icon coverage</h4>
+            <ul>
+              <li>▶ icon now appears on <code>@Composable</code> functions that live inside an <code>object</code> or <code>companion object</code>, not just top-level ones — covers common Material-design patterns (e.g. <code>NiaIcons</code>, <code>MaterialTheme</code>-style singletons).</li>
+              <li>Skipped explicitly (require a receiver instance): extension functions, <code>class</code> members, anonymous <code>@Composable</code> lambdas.</li>
+            </ul>
+
+            <h4>0.1.1 — Kotlin K2 mode compatibility</h4>
+            <ul>
+              <li>Declare <code>supportsKotlinPluginMode supportsK2="true"</code> — the plugin now loads in Android Studio K2 mode (and IntelliJ IDEA 2024.3+) without the "incompatible plugin" warning.</li>
+              <li>No code changes: our PSI usage was already K1/K2-agnostic; only the explicit manifest declaration was missing.</li>
+            </ul>
+
             <h4>0.1.0 — Initial public release</h4>
             <ul>
               <li>Device-less Compose preview via out-of-process renderer.</li>

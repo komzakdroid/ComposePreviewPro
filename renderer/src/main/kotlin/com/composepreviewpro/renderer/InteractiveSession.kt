@@ -67,31 +67,139 @@ class InteractiveSession(
      * clicks ▶ on a different composable.
      */
     @OptIn(InternalComposeApi::class)
-    fun mount(fn: KFunction<*>, args: Map<KParameter, Any?>): String {
+    fun mount(
+        fn: KFunction<*>,
+        args: Map<KParameter, Any?>,
+        classpathPaths: List<String> = emptyList(),
+    ): String {
         // Fresh inspection table per mount — old composition data is
         // stale once the content lambda changes.
         inspectionTables = mutableSetOf()
+        // If the user code was compiled for Android (typical for KMP
+        // projects that target only androidMain + iOS), Compose
+        // Multiplatform Resources's stringResource/painterResource will
+        // read LocalContext.current and crash with "LocalContext not
+        // present". Synthesise a Context stub on the user's classloader
+        // and provide it via CompositionLocalProvider so the read
+        // succeeds. The collectedProvidedValues list is empty when no
+        // Android runtime is in scope.
+        val userClassLoader: ClassLoader = fn.javaMethod?.declaringClass?.classLoader
+            ?: Thread.currentThread().contextClassLoader
+        val providedValues = buildAndroidLocalContextProvidedValues(userClassLoader, classpathPaths)
+        System.err.println(
+            "[InteractiveSession] mount: providedValues=${providedValues.size} " +
+                "(0 means non-Android scenario or stub failed)",
+        )
+
         scene.setContent {
             CompositionLocalProvider(
                 LocalInspectionMode provides true,
                 LocalInspectionTables provides inspectionTables,
             ) {
-                // ALSO grab the live Composer's data directly. Compose
-                // Multiplatform 1.10's LocalInspectionTables only
-                // captures the FIRST composition's data per JVM; this
-                // direct capture works on every mount.
                 captureComposerData()
-                MaterialTheme(
-                    colorScheme = when (theme) {
-                        PreviewTheme.LIGHT -> lightColorScheme()
-                        PreviewTheme.DARK -> darkColorScheme()
-                    },
-                ) {
-                    InvokeComposable(fn, args)
+                // INLINE provide: the LocalContext provider chain has
+                // to be in the SAME @Composable scope as the user's
+                // composable, with no wrapping helper function between
+                // them. We pass the array of ProvidedValue's directly
+                // to CompositionLocalProvider — its vararg overload
+                // accepts whatever we hand it.
+                CompositionLocalProvider(values = providedValues.toTypedArray()) {
+                    MaterialTheme(
+                        colorScheme = when (theme) {
+                            PreviewTheme.LIGHT -> lightColorScheme()
+                            PreviewTheme.DARK -> darkColorScheme()
+                        },
+                    ) {
+                        InvokeComposable(fn, args)
+                    }
                 }
             }
         }
         return renderToBase64Png()
+    }
+
+    /**
+     * Discover EVERY `LocalXxx` CompositionLocal that any Android
+     * Compose module exposes, and bind each one to a value the user's
+     * code can read without crashing.
+     *
+     * Why this is generic and not hand-rolled
+     * ----------------------------------------
+     * Real Android Compose code reads a long tail of CompositionLocals:
+     *
+     *   • `LocalContext`              — the Android Context graph (we
+     *                                   own this one and inject our
+     *                                   Mockito-built stub).
+     *   • `LocalConfiguration`        — `android.content.res.Configuration`.
+     *   • `LocalResources`            — `android.content.res.Resources`.
+     *   • `LocalView`                 — `android.view.View`.
+     *   • `LocalLifecycleOwner`       — `androidx.lifecycle.LifecycleOwner`
+     *                                   (lifecycle-runtime-compose).
+     *   • `LocalSavedStateRegistryOwner`
+     *                                 — `androidx.savedstate.…Owner`
+     *                                   (savedstate-compose).
+     *   • `LocalViewModelStoreOwner`  — viewmodel-compose.
+     *   • `LocalOnBackPressedDispatcherOwner`
+     *                                 — activity-compose.
+     *
+     * Hand-coding every entry was the bug pattern that surfaced as
+     * "LocalConfiguration not present" the moment a composable used
+     * `stringResource`. Instead: we **enumerate `getLocal*` static
+     * methods** on the well-known accessor classes, mock each target
+     * type with Mockito, and provide everything in one shot. Whatever
+     * the user's Compose module pulls in, we cover it.
+     *
+     * `LocalContext` is the only special case — we substitute our
+     * domain-aware Context stub so that asset reads can route through
+     * the user's classpath.
+     */
+    private fun buildAndroidLocalContextProvidedValues(
+        classLoader: ClassLoader,
+        classpathPaths: List<String>,
+    ): List<androidx.compose.runtime.ProvidedValue<*>> {
+        val graph = AndroidContextStub.createGraphOrNull(classLoader, classpathPaths)
+            ?: return emptyList()
+        // Build a Local-name → value override map so LocalResources and
+        // LocalConfiguration resolve to OUR domain-aware stubs instead
+        // of generic Mockito mocks. Critical because:
+        //
+        //   • `stringResource()` reads LocalResources.current.getString(id).
+        //     A generic Mockito Resources returns null, which then NPEs
+        //     when material3 Text(text: String!) parameter contract
+        //     rejects null.
+        //
+        //   • `LocalConfiguration` is checked by stringResource() to
+        //     force recomposition; using a real Configuration object
+        //     (no-arg ctor, perfectly valid) keeps locale lookups
+        //     consistent across recompositions.
+        val overrides = buildMap {
+            put("LocalResources", graph.resources)
+            graph.configuration?.let { put("LocalConfiguration", it) }
+        }
+        val androidProvideds = AndroidCompositionLocalProviders.discoverAndProvide(
+            classLoader = classLoader,
+            contextStub = graph.context,
+            overrides = overrides,
+        )
+        // ALSO discover user-defined CompositionLocals in their classpath.
+        // Real-world apps define their own theme-shaped Locals
+        // (LocalAuroraColors, LocalAppColors, LocalTypography, …) whose
+        // default factory throws unless the user wraps the composable
+        // in their app theme. We provide each with a Mockito mock so
+        // the preview renders something instead of crashing — Compose
+        // tolerates the mock's `0`/`null` defaults well enough for
+        // layout & paint.
+        val userProvideds = UserCompositionLocalsDiscoverer.discover(
+            classLoader = classLoader,
+            classpathRoots = classpathPaths,
+        )
+        val provideds = androidProvideds + userProvideds
+        System.err.println(
+            "[InteractiveSession] provided ${provideds.size} CompositionLocals " +
+                "(android=${androidProvideds.size}, user=${userProvideds.size}, " +
+                "${overrides.size} named overrides)",
+        )
+        return provideds
     }
 
     /**
