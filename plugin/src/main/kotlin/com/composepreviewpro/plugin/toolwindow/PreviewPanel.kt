@@ -6,7 +6,10 @@ import com.composepreviewpro.ipc.RenderSize
 import com.composepreviewpro.ipc.Scroll
 import com.composepreviewpro.plugin.service.PreviewService
 import com.intellij.icons.AllIcons
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
@@ -41,7 +44,7 @@ import javax.swing.SwingConstants
  *   user clicks toolbar → PreviewService.updateRenderParams() → new
  *   RenderRequest → renderer → showImage() back here.
  */
-class PreviewPanel(private val project: Project?) : JPanel(BorderLayout()) {
+class PreviewPanel(private val project: Project?) : JPanel(BorderLayout()), Disposable {
 
     // Legacy ctor for tests that don't have a Project on hand.
     constructor() : this(null)
@@ -113,6 +116,14 @@ class PreviewPanel(private val project: Project?) : JPanel(BorderLayout()) {
 
     init {
         background = JBColor.background()
+
+        // Register livePanel as a child Disposable so its embedded
+        // ComposePanel (Skia surface + AWT peer) and cached
+        // URLClassLoader are released when this panel is disposed.
+        // PreviewToolWindowFactory parents THIS panel against the
+        // ToolWindow Content disposable, so the chain reaches all the
+        // way to project close / tool window unregister.
+        Disposer.register(this, livePanel)
 
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 8, 4)).apply {
             background = JBColor.background()
@@ -378,7 +389,6 @@ class PreviewPanel(private val project: Project?) : JPanel(BorderLayout()) {
         val service = project?.getService(PreviewService::class.java) ?: return
         val mouse = object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
-                project?.getService(PreviewService::class.java)
                 // 1) Inspect mode is the most explicit signal — left
                 //    click selects an element regardless of modifiers.
                 // 2) Cmd / Ctrl click remains an always-on shortcut for
@@ -422,6 +432,21 @@ class PreviewPanel(private val project: Project?) : JPanel(BorderLayout()) {
     @Suppress("NOTHING_TO_INLINE")
     private inline fun String.shortName(): String =
         substringAfterLast('.').ifEmpty { this }
+
+    /**
+     * Called by Disposer when the parent ToolWindow Content is being
+     * unregistered (project close, plugin disable, tool window removal).
+     * Children registered with [Disposer.register(this, …)] — currently
+     * just [livePanel] — are disposed automatically BEFORE this body
+     * runs, so we don't need to call livePanel.dispose() ourselves.
+     *
+     * Swing components (deviceCombo, themeCombo, scroll, body, …) are
+     * plain JVM objects with no native resources; they become GC-eligible
+     * once the JFrame holding them goes away.
+     */
+    override fun dispose() {
+        thisLogger().info("[ComposePreview] PreviewPanel disposed")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────

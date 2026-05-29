@@ -19,6 +19,7 @@ import com.composepreviewpro.plugin.nav.SourceNavigator
 import com.composepreviewpro.plugin.reload.HotReloadCoordinator
 import com.composepreviewpro.plugin.toolwindow.PreviewPanel
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.externalSystem.util.ExternalSystemApiUtil
@@ -108,6 +109,38 @@ class PreviewService(private val project: Project) {
     private val snapshot = ClasspathSnapshot()
     @Volatile
     private var snapshotPrimed = false
+
+    /**
+     * Marshal a panel-update block onto the EDT with an explicit
+     * [ModalityState] and a project-disposed guard. Replaces every
+     * raw `ApplicationManager.getApplication().invokeLater { … }` call
+     * site in this service.
+     *
+     * **Why an explicit ModalityState?** From IntelliJ 2026.3 onward
+     * the platform will be stricter about runnables submitted without
+     * a modality argument: they may be silently dropped when the EDT is
+     * inside a modal dialog. We always want render results to land in
+     * the tool window, so we pin every panel update to
+     * [ModalityState.defaultModalityState] — the runnable runs as soon
+     * as the EDT is free for the modality state that was active when
+     * the background task was scheduled (typically NON_MODAL for our
+     * VFS- and ProgressManager-triggered work).
+     *
+     * **Why the disposed guard?** Renders run on background threads
+     * and can take seconds. If the project is closed in between, the
+     * queued runnable still fires and dereferences `panel?.` — usually
+     * harmless, but on a tight race it can resurrect a tool window that
+     * the platform was tearing down, causing leaks and stale-reference
+     * NPEs deeper in Swing. `project.disposed` is the canonical
+     * cancellation condition.
+     */
+    private fun runOnEdt(block: () -> Unit) {
+        ApplicationManager.getApplication().invokeLater(
+            block,
+            ModalityState.defaultModalityState(),
+            project.disposed,
+        )
+    }
 
     fun attachPanel(panel: PreviewPanel) {
         this.panel = panel
@@ -411,7 +444,7 @@ class PreviewService(private val project: Project) {
             thisLogger().info("[ComposePreview] selected: ${call.functionName} " +
                 "at ${call.file}:${call.line}  (${call.args.size} args)")
             val params = buildParamView(call)
-            ApplicationManager.getApplication().invokeLater {
+            runOnEdt {
                 panel?.showSelectedElement(call.functionName, params, call.file, call.line)
             }
             return
@@ -527,7 +560,7 @@ class PreviewService(private val project: Project) {
             when (val outcome = rendererService.interact(request)) {
                 is RendererProcess.Outcome.Success -> {
                     val r = outcome.result
-                    ApplicationManager.getApplication().invokeLater {
+                    runOnEdt {
                         panel?.showImage(target.fqn, r.pngBase64, r.widthPx, r.heightPx)
                     }
                 }
@@ -1015,13 +1048,13 @@ class PreviewService(private val project: Project) {
     }
 
     fun showRebuilding(fqn: String) {
-        ApplicationManager.getApplication().invokeLater {
+        runOnEdt {
             panel?.showLoading("Rebuilding: ${fqn.substringAfterLast('.')}")
         }
     }
 
     fun showError(target: String, message: String, stackTrace: String?) {
-        ApplicationManager.getApplication().invokeLater {
+        runOnEdt {
             panel?.showError(target, message, stackTrace)
         }
     }
@@ -1039,7 +1072,7 @@ class PreviewService(private val project: Project) {
             snapshot.diff(roots)
             snapshotPrimed = true
         }
-        ApplicationManager.getApplication().invokeLater {
+        runOnEdt {
             panel?.showImage(fqn, pngBase64, widthPx, heightPx)
         }
     }
@@ -1075,7 +1108,7 @@ class PreviewService(private val project: Project) {
             .map { it.toString() }
         if (classpathPaths.isEmpty()) return reportError("Empty production classpath")
         revealToolWindow()
-        ApplicationManager.getApplication().invokeLater {
+        runOnEdt {
             panel?.showLive(target.fqn, classpathPaths, target.theme)
         }
     }
@@ -1158,7 +1191,7 @@ class PreviewService(private val project: Project) {
                     thisLogger().info("[ComposePreview] snapshot primed " +
                         "(${roots.size} root(s) for hot-swap diffs)")
                     setHitMap(r.hitMap)
-                    ApplicationManager.getApplication().invokeLater {
+                    runOnEdt {
                         panel?.showImage(target.fqn, r.pngBase64, r.widthPx, r.heightPx)
                         // Don't clobber an active element selection — the
                         // user is editing one specific call site and the
@@ -1172,13 +1205,13 @@ class PreviewService(private val project: Project) {
                 is RendererProcess.Outcome.Errored -> {
                     val e: ErrorResponse = result.error
                     thisLogger().warn("[ComposePreview] render ERRORED: ${e.kind}: ${e.message}")
-                    ApplicationManager.getApplication().invokeLater {
+                    runOnEdt {
                         panel?.showError(target.fqn, "${e.kind}: ${e.message}", e.stackTrace)
                     }
                 }
                 is RendererProcess.Outcome.LaunchFailed -> {
                     thisLogger().error("[ComposePreview] launch FAILED: ${result.reason}")
-                    ApplicationManager.getApplication().invokeLater {
+                    runOnEdt {
                         panel?.showError(target.fqn, "Renderer launch failed", result.reason)
                     }
                 }
@@ -1234,7 +1267,7 @@ class PreviewService(private val project: Project) {
                     }
                 }
             }
-            ApplicationManager.getApplication().invokeLater {
+            runOnEdt {
                 panel?.showMultiFrame(target.fqn, frames)
             }
         }
@@ -1242,13 +1275,13 @@ class PreviewService(private val project: Project) {
 
     private fun reportError(message: String) {
         revealToolWindow()
-        ApplicationManager.getApplication().invokeLater {
+        runOnEdt {
             panel?.showError(target = "", message = message, stackTrace = null)
         }
     }
 
     private fun revealToolWindow() {
-        ApplicationManager.getApplication().invokeLater {
+        runOnEdt {
             ToolWindowManager.getInstance(project).getToolWindow("ComposePreview")?.show()
         }
     }

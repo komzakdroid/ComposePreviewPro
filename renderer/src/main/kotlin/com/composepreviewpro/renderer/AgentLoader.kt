@@ -10,18 +10,31 @@ import java.lang.management.ManagementFactory
  * Attach API, then exposes the [Instrumentation] reference the agent
  * captured.
  *
- * Why self-attach rather than `-javaagent:`?
+ * **Loading order (2026+)**: the primary path is `-javaagent:` at JVM
+ * startup, injected into `bin/renderer` / `bin/renderer.bat` by the
+ * `startScripts.doLast` block in `renderer/build.gradle.kts`. The
+ * agent's [com.composepreviewpro.agent.HotReloadAgent.premain] hook
+ * runs before `main()`, captures the [Instrumentation] reference into a
+ * static field, and [ensureLoaded] short-circuits on the first line
+ * because `HotReloadAgent.instrumentation` is already non-null. No
+ * Attach API call is made in this case — JEP 451 stays happy and the
+ * "Dynamic loading of agents will be disallowed" warning is silenced
+ * because no dynamic loading is performed.
  *
- *   The Gradle `application` plugin generates a launcher script that does
- *   not have a stable way to point at a JAR inside `$APP_HOME/lib` for
- *   the `-javaagent:` flag. Self-attach avoids that brittleness: we ask
- *   the running JVM where the agent class was loaded from, then attach
- *   its JAR to ourselves. This works identically on bin/renderer (Unix)
- *   and bin/renderer.bat (Windows).
+ * **Self-attach is now the fallback** for legacy paths where the
+ * startScript injection cannot be honoured: manual `java -cp …`
+ * invocation, an obscure shell that mangles `$APP_HOME`, or a smoke
+ * test that runs the renderer through Gradle's classpath rather than
+ * the installed launcher. The renderer still ships
+ * `-Djdk.attach.allowAttachSelf=true` and `-XX:+EnableDynamicAgentLoading`
+ * in `applicationDefaultJvmArgs` so this fallback remains viable on
+ * JDK 21+.
  *
- * Prerequisites at JVM startup:
+ * Prerequisites for the fallback path:
  *   • `-Djdk.attach.allowAttachSelf=true` (Java 9+) — enables a process
  *     to attach to its own PID. Configured in renderer/build.gradle.kts.
+ *   • `-XX:+EnableDynamicAgentLoading` (Java 21+) — opts in to the JEP 451
+ *     transitional warning suppression. Also configured in build.gradle.kts.
  *   • The `jdk.attach` JDK module on the platform classloader — present
  *     in every standard JRE.
  */

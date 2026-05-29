@@ -58,17 +58,73 @@ dependencies {
 
 application {
     mainClass.set("com.composepreviewpro.renderer.RendererMainKt")
-    // Self-attach requires `jdk.attach.allowAttachSelf=true` since Java 9.
-    // The attach API is module `jdk.attach`, on the platform classloader,
-    // available in standard JREs without further `--add-modules`.
     applicationDefaultJvmArgs = listOf(
+        // Backstop for legacy paths where the startScript-injected
+        // `-javaagent:` line cannot be honoured — manual `java -cp …`
+        // invocation, an obscure shell that mangles `$APP_HOME`,
+        // Mockito's inline mock maker that wants its own JVMTI attach
+        // for the Android Context stub. Self-attach via the Attach
+        // API stays viable as long as these two flags are set. Both
+        // flags are no-ops once the primary `-javaagent:` path
+        // succeeds, because [com.composepreviewpro.agent.HotReloadAgent.premain]
+        // populates the static `instrumentation` field before
+        // `AgentLoader.ensureLoaded` ever runs — the loader is
+        // idempotent and returns the existing reference.
         "-Djdk.attach.allowAttachSelf=true",
-        // Silences the "Dynamic loading of agents will be disallowed in a
-        // future release" warning. We deliberately load the hot-reload
-        // agent at runtime via the Attach API; this flag is the JVM's
-        // sanctioned way to opt in.
         "-XX:+EnableDynamicAgentLoading",
     )
+}
+
+// Inject `-javaagent:$APP_HOME/lib/composepreviewpro-hot-reload-agent.jar`
+// into the generated `bin/renderer` / `bin/renderer.bat` start scripts so
+// the agent's `premain` hook captures the JVM `Instrumentation` reference
+// at startup. This is the JEP 451-safe path: JDK 21+ prints a warning on
+// every Attach-API self-load and a future JDK will make self-attach fail
+// by default. Loading the agent through `-javaagent:` at JVM start is the
+// long-term sanctioned mechanism — same Instrumentation reference, no
+// warning, no future breakage.
+//
+// We cannot inject this through `applicationDefaultJvmArgs` because the
+// generated script wraps `DEFAULT_JVM_OPTS` in single quotes (Unix) /
+// re-escapes `$` via sed (POSIX `xargs … sed … eval` pipeline), so a
+// literal `$APP_HOME` survives verbatim and is passed to the JVM
+// un-expanded. Instead we prepend a SECOND `DEFAULT_JVM_OPTS=…`
+// assignment in double quotes so `$APP_HOME` (set earlier in the script)
+// expands at the assignment line, before the eval pipeline runs.
+tasks.startScripts {
+    doLast {
+        val agentJar = "composepreviewpro-hot-reload-agent.jar"
+
+        // Unix: anchor on the original DEFAULT_JVM_OPTS line generated
+        // by the application plugin (it's stable across Gradle versions
+        // — only the contents inside the single quotes vary).
+        val unix = unixScript
+        if (unix.exists()) {
+            val text = unix.readText()
+            val anchor = Regex("^DEFAULT_JVM_OPTS=.*$", RegexOption.MULTILINE).find(text)
+            if (anchor != null) {
+                val injection = "\n# [ComposePreviewPro] JEP 451-safe agent load — prepend before eval pipeline.\n" +
+                    "DEFAULT_JVM_OPTS=\"-javaagent:\$APP_HOME/lib/$agentJar \$DEFAULT_JVM_OPTS\""
+                unix.writeText(text.substring(0, anchor.range.last + 1) + injection + text.substring(anchor.range.last + 1))
+            } else {
+                throw GradleException("startScripts (Unix) — DEFAULT_JVM_OPTS line not found; cannot inject -javaagent:")
+            }
+        }
+
+        // Windows .bat: `set DEFAULT_JVM_OPTS=…` line, similar anchor.
+        val win = windowsScript
+        if (win.exists()) {
+            val text = win.readText()
+            val anchor = Regex("^set DEFAULT_JVM_OPTS=.*$", RegexOption.MULTILINE).find(text)
+            if (anchor != null) {
+                val injection = "\r\n@rem [ComposePreviewPro] JEP 451-safe agent load.\r\n" +
+                    "set DEFAULT_JVM_OPTS=-javaagent:\"%APP_HOME%\\lib\\$agentJar\" %DEFAULT_JVM_OPTS%"
+                win.writeText(text.substring(0, anchor.range.last + 1) + injection + text.substring(anchor.range.last + 1))
+            } else {
+                throw GradleException("startScripts (Windows) — DEFAULT_JVM_OPTS line not found; cannot inject -javaagent:")
+            }
+        }
+    }
 }
 
 // Standalone smoke test that bypasses IPC and writes PNGs to ./smoke-out/.

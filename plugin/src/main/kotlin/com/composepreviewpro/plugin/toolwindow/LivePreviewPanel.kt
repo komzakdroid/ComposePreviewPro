@@ -7,10 +7,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.currentComposer
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.awt.ComposePanel
 import com.composepreviewpro.ipc.PreviewTheme
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.ui.JBColor
+import com.intellij.util.ui.EDT
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.io.File
@@ -29,6 +32,21 @@ import kotlin.reflect.jvm.javaMethod
  * composable AS A REAL COMPOSE UI inside the plugin's JVM, so clicks,
  * scrolls, hovers, and text input behave exactly like in the deployed
  * app.
+ *
+ * Lifecycle: implements [Disposable]; the IDE registers this against
+ * the parent [PreviewPanel] (which is itself a child of the tool window
+ * content). On project close / plugin disable, [dispose] tears down the
+ * embedded [ComposePanel] (releasing the Skia surface and the AWT peer)
+ * and closes the cached [URLClassLoader] so the user's project JARs
+ * aren't held open after the IDE no longer needs them. Without this,
+ * a heap dump after a dozen project switches shows N parallel copies of
+ * every user JAR pinned in the OS file cache.
+ *
+ * Threading: [show] / [clear] must be called from the EDT. Swing widget
+ * mutation and `ComposePanel.setContent` are both EDT-only operations.
+ * Callers from background coroutines / pooled threads must marshal via
+ * `ApplicationManager.invokeLater`. The methods assert this contract
+ * with [EDT.assertIsEdt] so misuse fails loud during development.
  *
  * Architecture trade-offs (vs the PNG renderer):
  *
@@ -53,7 +71,7 @@ import kotlin.reflect.jvm.javaMethod
  * sibling) for safety + cross-version compatibility, and live mode for
  * fidelity. The toolbar lets the user switch.
  */
-class LivePreviewPanel : JPanel(BorderLayout()) {
+class LivePreviewPanel : JPanel(BorderLayout()), Disposable {
 
     private val composePanel = ComposePanel()
     private val emptyLabel = JLabel(
@@ -66,8 +84,12 @@ class LivePreviewPanel : JPanel(BorderLayout()) {
 
     // Cached loader per classpath signature — recreated when the user
     // edits the project so newly-compiled .class files actually load.
+    // Always touched on the EDT (via show/clear), so no @Volatile needed.
     private var cachedLoader: URLClassLoader? = null
     private var cachedSignature: String? = null
+
+    @Volatile
+    private var disposed: Boolean = false
 
     init {
         background = JBColor.background()
@@ -80,12 +102,17 @@ class LivePreviewPanel : JPanel(BorderLayout()) {
      * that compile-on-save / Gradle output changes are picked up.
      */
     fun show(fqn: String, classpath: List<String>, theme: PreviewTheme) {
+        EDT.assertIsEdt()
+        if (disposed) {
+            thisLogger().warn("[ComposePreview-Live] show() called after dispose() — ignored")
+            return
+        }
         try {
             removeAll()
             add(composePanel, BorderLayout.CENTER)
 
             val loader = ensureLoader(classpath)
-            val (cls, fn) = resolve(loader, fqn) ?: run {
+            val (_, fn) = resolve(loader, fqn) ?: run {
                 replaceWithMessage("Composable not found: $fqn")
                 return
             }
@@ -106,10 +133,41 @@ class LivePreviewPanel : JPanel(BorderLayout()) {
     }
 
     fun clear() {
+        EDT.assertIsEdt()
+        if (disposed) return
         removeAll()
         add(emptyLabel, BorderLayout.CENTER)
         revalidate()
         repaint()
+    }
+
+    override fun dispose() {
+        // Idempotent: Disposer may call us once explicitly and once via
+        // a parent chain in pathological reload scenarios. Guard so we
+        // don't double-close native handles.
+        if (disposed) return
+        disposed = true
+
+        try {
+            cachedLoader?.close()
+        } catch (t: Throwable) {
+            thisLogger().warn("[ComposePreview-Live] URLClassLoader.close failed", t)
+        }
+        cachedLoader = null
+        cachedSignature = null
+
+        try {
+            // Releases the Skia surface + AWT peer. Without this, every
+            // tool-window close leaks a Skiko-backed framebuffer.
+            // `ComposePanel.dispose` is `@ExperimentalComposeUiApi` in
+            // Compose Multiplatform 1.10 — there is no stable equivalent
+            // for releasing the native surface, so we accept the opt-in
+            // and pin it locally to this call.
+            @OptIn(ExperimentalComposeUiApi::class)
+            composePanel.dispose()
+        } catch (t: Throwable) {
+            thisLogger().warn("[ComposePreview-Live] ComposePanel.dispose failed", t)
+        }
     }
 
     // ── internals ────────────────────────────────────────────────

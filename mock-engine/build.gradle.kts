@@ -6,7 +6,9 @@
  * real data. MVP supports primitives, () -> Unit lambdas, and Modifier.
  *
  * Depends on Compose runtime ONLY to know what `Modifier` is. Does NOT depend
- * on Compose UI (no rendering, no Material). Keep this layer slim.
+ * on Compose UI for rendering — keep this layer slim. The CMP plugin's
+ * `compose.runtime` / `compose.ui` DSL accessors were deprecated in 1.10;
+ * we now use the explicit Maven coordinates from `libs.versions.toml`.
  */
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -19,6 +21,6 @@ dependencies {
     api(libs.kotlin.reflect)
 
     // We need Modifier (and only Modifier) from Compose UI to recognise it.
-    api(compose.runtime)
-    api(compose.ui)
+    api(libs.compose.runtime)
+    api(libs.compose.ui)
 }

@@ -7,11 +7,9 @@ import com.composepreviewpro.ipc.RedefineClasses
 import com.composepreviewpro.ipc.RenderRequest
 import com.composepreviewpro.ipc.RenderResult
 import com.composepreviewpro.ipc.RendererSubprocess
-import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.thisLogger
-import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.project.Project
 import java.io.File
 
@@ -167,11 +165,10 @@ class RendererProcess(private val project: Project) : Disposable {
      *   1. Explicit override — system property or env var (developer
      *      tooling, CI, custom installs).
      *   2. **The renderer bundled inside this plugin's install directory.**
-     *      For production-installed plugins, IntelliJ reports the on-disk
-     *      directory via [PluginManagerCore.getPlugin(...).pluginPath].
-     *      We append `/renderer/bin/renderer` to it — that path is
-     *      populated at packaging time by build.gradle.kts's
-     *      `prepareSandbox` customisation.
+     *      Resolved via our own class's [java.security.CodeSource] — the
+     *      IDE always loads plugin JARs from a per-plugin `lib/` folder,
+     *      so walking two parents up from the JAR gives the plugin root.
+     *      Pure JVM stdlib, no IntelliJ Platform internal API needed.
      *   3. Dev locations relative to `user.dir` — for running an
      *      unpackaged plugin directly out of the source tree.
      *
@@ -228,16 +225,29 @@ class RendererProcess(private val project: Project) : Disposable {
      * `plugin/build/idea-sandbox/.../plugins-prepared/<pluginName>/`.
      * For a real user install it's somewhere under
      * `~/Library/Application Support/<IDE>/plugins/<pluginName>/` on
-     * macOS, or the platform-equivalent path. Returns null only if the
-     * plugin descriptor cannot be found (shouldn't happen at runtime).
+     * macOS, or the platform-equivalent path.
+     *
+     * We resolve it by inspecting our own [Class.getProtectionDomain]
+     * `CodeSource`. The IDE loads plugin classes from
+     * `<plugin-root>/lib/<jar>.jar`, so the CodeSource location is that
+     * JAR, and walking two `parentFile`s up gives the plugin root.
+     * This avoids `PluginManagerCore.getPlugin(...)` and
+     * `PluginManager.findEnabledPlugin(...)`, both of which are marked
+     * `@ApiStatus.Internal` and flagged by the Marketplace verifier.
      */
     private fun pluginInstallDir(): File? {
-        val descriptor = PluginManagerCore.getPlugin(PluginId.getId(PLUGIN_ID))
-        val path = descriptor?.pluginPath ?: return null
-        return path.toFile()
-    }
-
-    private companion object {
-        const val PLUGIN_ID = "com.composepreviewpro"
+        return try {
+            val source = RendererProcess::class.java.protectionDomain?.codeSource ?: return null
+            val location = source.location ?: return null
+            // location is a file: URL pointing at .../lib/<plugin>.jar
+            val jarFile = File(location.toURI())
+            val libDir = jarFile.parentFile ?: return null
+            libDir.parentFile
+        } catch (t: Throwable) {
+            thisLogger().warn(
+                "[ComposePreview] could not resolve plugin install dir from CodeSource", t
+            )
+            null
+        }
     }
 }

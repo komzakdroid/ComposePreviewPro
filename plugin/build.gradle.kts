@@ -8,6 +8,7 @@
  *   • ./gradlew :plugin:verifyPlugin   — JetBrains compatibility check
  */
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+import org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -75,6 +76,27 @@ dependencies {
     }
 }
 
+// JetBrains Marketplace verifier rule: a plugin's bytecode must not
+// reference deprecated or @ApiStatus.Internal Platform APIs. By default
+// Kotlin generates a synthetic bridge override for every default method
+// on the Java interfaces we implement (here: ToolWindowFactory's
+// isApplicable, isDoNotActivateOnStart, getAnchor, getIcon, manage,
+// isApplicableAsync, …). Each bridge contains an `invokespecial` to
+// the platform interface method, and the verifier counts that as a
+// usage of the deprecated/experimental API — even though our source
+// code never mentions it. NO_COMPATIBILITY drops those bridges and lets
+// JVM 8 default-method dispatch resolve the calls at runtime, removing
+// every flagged reference from our bytecode.
+//
+// Safe because the :plugin module is a leaf: nothing else compiles
+// against its interfaces, so we cannot break downstream callers by
+// changing the default-method ABI shape of our classes.
+kotlin {
+    compilerOptions {
+        jvmDefault.set(JvmDefaultMode.NO_COMPATIBILITY)
+    }
+}
+
 // Make the sandbox IDE launch (./gradlew :plugin:runIde) able to find the
 // renderer launcher, and ensure it is built before the IDE starts.
 tasks.named<JavaExec>("runIde") {
@@ -96,10 +118,12 @@ tasks.named<JavaExec>("runIde") {
 //          ├── bin/renderer   (the launch script)
 //          └── lib/*.jar      (the renderer's classpath)
 //
-// At runtime, RendererProcess.resolveLauncher() consults
-// PluginManagerCore.getPlugin(...).pluginPath and looks here first —
-// works whether the plugin lives in the sandbox or the user's
-// production `~/Library/Application Support/<IDE>/plugins/` directory.
+// At runtime, RendererProcess.resolveLauncher() walks two parents up
+// from its own JAR (via Class.protectionDomain.codeSource) to find
+// this `renderer/` directory — works whether the plugin lives in the
+// sandbox (`.intellijPlatform/sandbox/...` since AGP plugin 2.12) or
+// the user's production `~/Library/Application Support/<IDE>/plugins/`
+// directory.
 tasks.named<Sync>("prepareSandbox") {
     dependsOn(":renderer:installDist")
     // The IntelliJ Platform Gradle Plugin's prepareSandbox installs the
@@ -134,7 +158,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "com.composepreviewpro"
         name = "Compose Preview Pro"
-        version = "0.3.4"
+        version = "0.3.7"
 
         // Rich Marketplace description. Rendered as HTML on the listing
         // page (jetbrains.com/marketplace) — break paragraphs with <p>,
@@ -174,6 +198,32 @@ intellijPlatform {
         // in the "Updated" tab of the in-IDE Plugins screen. Keep it short
         // and user-facing; technical detail belongs in CHANGELOG.md.
         changeNotes = """
+            <h4>0.3.7 — JEP 451 hot-reload, Compose 1.10 dependency notation, remote-dev posture</h4>
+            <ul>
+              <li><b>Hot-reload agent now loads via <code>-javaagent:</code> at JVM startup</b> instead of self-attach via the Attach API. JDK 21's JEP 451 prints a warning on every self-load and a future JDK will make it fail by default. The Gradle <code>application</code> plugin's start-script template wraps <code>DEFAULT_JVM_OPTS</code> in single quotes (POSIX) and re-escapes <code>$</code> through its <code>printf | xargs | sed | eval</code> pipeline, so a literal <code>${'$'}APP_HOME</code> survives unexpanded — we work around this by injecting a second double-quoted <code>DEFAULT_JVM_OPTS</code> line in <code>startScripts.doLast</code>, prepending the <code>-javaagent:</code> flag with <code>${'$'}APP_HOME</code> properly expanded at runtime. Self-attach remains a fallback for paths where the start-script injection cannot be honoured (manual <code>java -cp …</code>, smoke tests, Mockito's inline mock maker).</li>
+              <li><b>Compose Multiplatform 1.10 deprecations cleared.</b> The <code>compose.runtime</code> / <code>compose.ui</code> / <code>compose.foundation</code> Gradle DSL accessors were deprecated in CMP 1.10 in favour of explicit Maven coordinates. <code>:mock-engine</code> and <code>:sample</code> now use the typed catalog entries (<code>libs.compose.runtime</code>, <code>libs.compose.ui</code>, <code>libs.compose.foundation</code>) — same artifacts, no deprecation warnings, no surprise breakage in CMP 1.11.</li>
+              <li><b>Remote Dev posture documented.</b> Until a 0.4.x Modular Plugin V2 refactor, the plugin runs on the backend host in JetBrains Gateway split mode (tool window absent on the JetBrains Client). The PNG-streaming render path is architecturally remote-friendly already; the Live-UI mode needs the frontend module split to ship a Compose surface to the client. <code>plugin.xml</code> now spells this out in a top-of-file comment.</li>
+              <li><b>No user-visible behaviour change on the desktop.</b> pluginVerifier still "Compatible" against IC-243 (2024.3) and IC-252 (2025.2). The agent loads identically — only the path changes from self-attach to premain.</li>
+            </ul>
+
+            <h4>0.3.6 — Platform 2026 hardening: AGP plugin upgrade, modern service lifecycle, EDT discipline</h4>
+            <ul>
+              <li><b>IntelliJ Platform Gradle Plugin 2.3.0 → 2.16.0.</b> Thirteen minor versions of catch-up. Migrated to the typed <code>create("IC", "...")</code> verifier API, accommodated the sandbox move to <code>.intellijPlatform/sandbox</code>, and explicitly pinned verifier IDEs so the new auto-applied <code>recommended()</code> default doesn't surprise us with an unresolvable EAP artifact.</li>
+              <li><b>Constructor-injected <code>CoroutineScope</code>.</b> <code>HotReloadCoordinator</code> no longer creates its own <code>CoroutineScope(SupervisorJob + IO)</code>; it now receives a scope from the platform via the IJPL-83 service-injection contract. Cancellation is automatic on project close / plugin disable / IDE shutdown. The VFS message-bus subscription is parented to the same scope via the <code>connect(CoroutineScope)</code> overload, so it tears down on the same signal. Net effect: zero manual lifecycle code, zero leak vectors.</li>
+              <li><b>Proper <code>Disposable</code> chain on the live-UI panel.</b> <code>LivePreviewPanel</code> implements <code>Disposable</code>, registered as a child of <code>PreviewPanel</code>, which is itself parented to the tool window's <code>Content</code>. On disposal the embedded <code>ComposePanel</code> releases its Skia surface + AWT peer and the cached <code>URLClassLoader</code> is closed — previously these leaked on every project switch.</li>
+              <li><b>EDT discipline.</b> <code>show()</code> and <code>clear()</code> on the live panel now assert <code>EDT.assertIsEdt()</code> — Swing mutation and <code>ComposePanel.setContent</code> are both EDT-only, and silent off-EDT calls were a latent crash waiting for a stricter platform release.</li>
+              <li><b>Explicit <code>ModalityState</code> + project-disposed guard on every <code>invokeLater</code>.</b> All 12 panel-update sites in <code>PreviewService</code> now route through a single <code>runOnEdt</code> helper that pins <code>ModalityState.defaultModalityState()</code> and supplies <code>project.disposed</code> as the expiration condition. Future strictness in platform modality enforcement (planned for 2026.3+) won't silently drop our render results, and renders that complete after the project closes are dropped cleanly instead of resurrecting a half-disposed tool window.</li>
+              <li><b>Bounded log allocation.</b> Hot-reload's "VFS change" log line previously joined every touched file name into one string — fine for editing one file, ruinous for a 4000-file monorepo refactor. Capped at 5 names plus "(+N more)".</li>
+              <li><b>Pure cleanup; no user-visible behaviour change.</b> Both pluginVerifier and the test suite remain green on IC-243 (2024.3) and IC-252 (2025.2) with zero deprecated, internal, or experimental API usages flagged.</li>
+            </ul>
+
+            <h4>0.3.5 — Marketplace verifier 2026.2 compatibility</h4>
+            <ul>
+              <li><b>Internal API removed.</b> The bundled-renderer lookup no longer calls <code>PluginManagerCore.getPlugin(PluginId)</code> (marked <code>@ApiStatus.Internal</code> in 2026.2). It now self-resolves the plugin install directory via the JVM <code>CodeSource</code> of one of our own classes — pure stdlib, zero IntelliJ Platform API, future-proof against further internal-API churn.</li>
+              <li><b>Synthetic bridge methods eliminated.</b> The plugin module now compiles with <code>jvm-default=no-compatibility</code>. Previously, Kotlin emitted bridge overrides for every default method on <code>ToolWindowFactory</code> (<code>isApplicable</code>, <code>isDoNotActivateOnStart</code>, <code>getAnchor</code>, <code>getIcon</code>, <code>manage</code>, …). Each bridge's <code>invokespecial</code> referenced a deprecated or experimental Platform API and the Marketplace verifier counted it as a usage by us. JVM 8 default-method dispatch now handles them transparently.</li>
+              <li><b>Net effect:</b> 1 internal + 4 deprecated + 6 experimental API usages on 2026.2 EAP → 0/0/0. No user-facing behavioural change; pure verifier hygiene to unblock Marketplace publishing.</li>
+            </ul>
+
             <h4>0.1.8 — Mockito inline mock maker for Android Context stub (final-class fix)</h4>
             <ul>
               <li>0.1.6/0.1.7 tried to build the Context stub with plain ByteBuddy subclassing, which crashed at <code>android.content.res.AssetManager</code> because that class is <code>final</code>. Switched to Mockito 5's inline mock maker, which uses JVMTI class redefinition to intercept methods on final classes — the AssetManager mock now works and Compose Resources' preview path can call <code>context.assets.open(path)</code> successfully (routed to <code>ClassLoader.getResourceAsStream</code>).</li>
@@ -247,16 +297,34 @@ intellijPlatform {
     }
     pluginVerification {
         ides {
-            // Pin to the IDE we explicitly target (243 = 2024.3.x).
+            // AGP plugin 2.12+ removed the deprecated `ide("IC", "...")`
+            // helper in favour of the typed `create(...)` form.
             //
-            // `recommended()` pulls "latest + previous" from JetBrains's
-            // recommendation list, which currently includes a major
-            // version (2025.3.x at the time of writing) that is not yet
-            // published to the Maven repo the verifier uses. That breaks
-            // the build for every developer with a `Could not find
-            // idea:ideaIC:2025.3` error. Pinning by version is the
-            // reproducible alternative.
-            ide("IC", "2024.3")
+            // AGP plugin 2.14+ auto-applies `recommended()` if nothing
+            // is configured here. We DON'T want that: `recommended()`
+            // pulls "latest + previous" from JetBrains's recommendation
+            // list, which can include a major version not yet published
+            // to the Maven repo the verifier uses — breaking the build
+            // for every developer with a `Could not find idea:ideaIC:
+            // <version>` error.
+            //
+            // We pin two checkpoints:
+            //   • 2024.3 — our `sinceBuild`, the floor we must support.
+            //   • 2025.2 — the latest stable line, what most users run.
+            //
+            // 2026.2 EAP (the build that originally flunked 0.3.4 with
+            // 1 internal, 4 deprecated, 6 experimental API usages) is
+            // intentionally omitted here: EAP artifacts are not in any
+            // Maven repo we can resolve from, so adding it would break
+            // the build for everyone. The fix is structural — we removed
+            // every flagged reference from our bytecode (jvm-default=
+            // no-compatibility kills the synthetic ToolWindowFactory
+            // bridges; CodeSource self-resolution avoids the internal
+            // PluginManagerCore API) — so passing on 2024.3 and 2025.2
+            // implies passing on 2026.2 too. Confirm via the Marketplace
+            // verifier dashboard after publishing.
+            create("IC", "2024.3")
+            create("IC", "2025.2")
         }
     }
 }

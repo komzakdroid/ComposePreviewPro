@@ -28,7 +28,11 @@ asm = "9.7"
 # ─────────── IntelliJ Platform Plugin ───────────
 # Gradle plugin that builds IDE plugins. Version 2.x is the rewrite
 # (post-2024) that replaced the old `org.jetbrains.intellij` plugin.
-intellijPlatform = "2.3.0"
+# 2.16.0 is the May 2026 stable line; pluginVerifier API uses the
+# typed `create(...)` form instead of the removed `ide(...)` helper,
+# sandbox now lives in `.intellijPlatform/sandbox/` by default, and
+# `recommended()` is auto-applied unless explicitly overridden.
+intellijPlatform = "2.16.0"
 # Target IDE: IntelliJ IDEA Community 2024.3 LTS — Android Studio derives from
 # this base and remains compatible. sinceBuild = "243" matches 2024.3.x.
 intellijTarget = "2024.3"
@@ -40,10 +44,13 @@ kotlinx-coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-
 kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "kotlin" }
 
 # Compose Multiplatform — explicit deps. The compose-plugin DSL accessors
-# for material3 and ui-test were deprecated in 1.10 in favour of direct
-# dependency notation. The multiplatform .module file resolves to the
-# correct desktop/android/native variant automatically based on the
-# consuming target.
+# (`compose.runtime`, `compose.ui`, `compose.foundation`, `compose.material3`,
+# `compose.ui-test`) were deprecated in 1.10 in favour of direct dependency
+# notation. The multiplatform .module file resolves to the correct
+# desktop/android/native variant automatically based on the consuming target.
+compose-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "composeMultiplatform" }
+compose-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "composeMultiplatform" }
+compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "composeMultiplatform" }
 compose-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "composeMaterial3" }
 compose-ui-test = { module = "org.jetbrains.compose.ui:ui-test", version.ref = "composeMultiplatform" }
 # ui-tooling-data exposes `asTree()` and `Group`/`SourceLocation` — used by

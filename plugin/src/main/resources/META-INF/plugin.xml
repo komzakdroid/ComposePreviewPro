@@ -7,6 +7,29 @@
          warning ("element already defined"), so we keep ONLY the wiring
          (depends + extensions) here. -->
 
+    <!-- ─────────────────────────────────────────────────────────────
+         Remote Dev / JetBrains Gateway status (May 2026):
+
+         This plugin uses the legacy single-descriptor Plugin Model V1.
+         In split mode, the platform falls back to loading it on the
+         BACKEND host only — the tool window will not appear in a
+         JetBrains Client connected to a remote backend.
+
+         The PNG-streaming render path is inherently remote-dev-friendly
+         (out-of-process subprocess on the backend, PNG bytes shipped to
+         the frontend via the existing tool-window content RPC); the
+         Live-UI mode is not, because ComposePanel needs a display
+         server which the backend host typically lacks.
+
+         Proper support requires Modular Plugin V2 with at least
+         `shared` + `frontend` content modules — ToolWindowFactory and
+         the Compose-Desktop-bearing UI live in the frontend module,
+         the GradleCompiler + PSI inspection + RendererProcess service
+         live in shared/backend. Scheduled for the 0.4.x architectural
+         refactor. Tracking against the JetBrains modular plugin
+         template: https://github.com/JetBrains/intellij-platform-modular-plugin-template
+         ─────────────────────────────────────────────────────────── -->
+
     <!-- Platform module gives us the basic IDE plugin API.
          Kotlin plugin gives PSI access to @Composable functions in .kt files.
          Java module is required transitively by Kotlin's PSI in current IDEs. -->

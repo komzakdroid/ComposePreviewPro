@@ -4,6 +4,7 @@ import com.composepreviewpro.plugin.service.PreviewService
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.ui.content.ContentFactory
@@ -28,6 +29,18 @@ class PreviewToolWindowFactory : ToolWindowFactory, DumbAware {
             /* displayName = */ "",
             /* isLockable  = */ false,
         )
+
+        // Parent the panel to the Content's Disposable. Content lifecycle
+        // = tool window lifecycle: when the user removes the tool window,
+        // closes the project, or disables our plugin, every child
+        // registered via Disposer.register(this, …) cascade-disposes.
+        // PreviewPanel registers livePanel in turn, so the embedded
+        // ComposePanel (Skia surface + AWT peer) and its cached
+        // URLClassLoader release together. Without this chain we leaked
+        // a Skiko framebuffer + the user's project JARs on every
+        // project switch.
+        Disposer.register(content, panel)
+
         toolWindow.contentManager.addContent(content)
         thisLogger().info("[ComposePreview] PreviewPanel content added to tool window")
 

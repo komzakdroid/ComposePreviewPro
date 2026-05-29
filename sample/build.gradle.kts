@@ -16,11 +16,12 @@ composeCompiler {
     includeSourceInformation.set(true)
 }
 
+// The CMP plugin's `compose.runtime` / `compose.foundation` / `compose.ui` /
+// `compose.material3` DSL accessors were deprecated in 1.10 in favour of
+// explicit Maven coordinates, declared in `libs.versions.toml`.
 dependencies {
-    implementation(compose.runtime)
-    implementation(compose.foundation)
-    implementation(compose.ui)
-    // material3 DSL accessor was deprecated in Compose 1.10 — use the
-    // explicit Maven coordinate.
+    implementation(libs.compose.runtime)
+    implementation(libs.compose.foundation)
+    implementation(libs.compose.ui)
     implementation(libs.compose.material3)
 }

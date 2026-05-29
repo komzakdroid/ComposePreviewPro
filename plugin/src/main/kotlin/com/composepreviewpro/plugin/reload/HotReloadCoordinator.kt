@@ -5,8 +5,8 @@ import com.composepreviewpro.ipc.RedefineClasses
 import com.composepreviewpro.plugin.client.GradleCompiler
 import com.composepreviewpro.plugin.client.RendererProcess
 import com.composepreviewpro.plugin.service.PreviewService
-import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.module.Module
@@ -21,8 +21,6 @@ import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -33,36 +31,36 @@ import java.util.UUID
  * being previewed, kicks off an incremental compile and — on success —
  * re-issues the last render request.
  *
- * This service is intentionally [Disposable] and owns its own
- * [CoroutineScope] rather than relying on platform-injected scopes, because
- * the auto-injection contract has changed between IntelliJ Platform 2024.x
- * versions and we want to compile against the lowest baseline.
+ * Lifecycle: the [cs] parameter is injected by the platform (IJPL-83,
+ * stable since IDEA 2023.2). The platform cancels it automatically when
+ * this service unloads — project close, plugin disable, or IDE shutdown
+ * — so we no longer implement [com.intellij.openapi.Disposable] or
+ * manage a manual [SupervisorJob]. The same `cs` is also passed to
+ * [com.intellij.util.messages.MessageBus.connect] so the VFS
+ * subscription tears down on the same signal.
  */
 @Service(Service.Level.PROJECT)
-class HotReloadCoordinator(private val project: Project) : Disposable {
-
-    private val scope: CoroutineScope =
-        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+class HotReloadCoordinator(
+    private val project: Project,
+    private val cs: CoroutineScope,
+) {
 
     private val previewService: PreviewService
         get() = project.getService(PreviewService::class.java)
 
+    @Volatile
     private var debounceJob: Job? = null
 
     init {
         thisLogger().info("[ComposePreview] HotReloadCoordinator init for project: ${project.name}")
         try {
             project.messageBus
-                .connect(this)
+                .connect(cs)
                 .subscribe(VirtualFileManager.VFS_CHANGES, FileChangeBus())
-            thisLogger().info("[ComposePreview] VFS_CHANGES subscription installed")
+            thisLogger().info("[ComposePreview] VFS_CHANGES subscription installed (parent=cs)")
         } catch (t: Throwable) {
             thisLogger().error("[ComposePreview] Failed to subscribe to VFS_CHANGES", t)
         }
-    }
-
-    override fun dispose() {
-        scope.cancel()
     }
 
     private inner class FileChangeBus : BulkFileListener {
@@ -78,8 +76,13 @@ class HotReloadCoordinator(private val project: Project) : Disposable {
     }
 
     private fun onKotlinFilesChanged(files: List<VirtualFile>) {
-        thisLogger().info("[ComposePreview] VFS change: ${files.size} .kt file(s): " +
-            files.joinToString(", ") { it.name })
+        // Bounded log: a refactor across a monorepo can touch thousands
+        // of files. Logging "1 file(s): A.kt" is useful; logging
+        // "4711 file(s): A.kt, B.kt, …, ZZZ.kt" blows the log allocation
+        // budget and never gets read anyway.
+        val preview = files.take(5).joinToString(", ") { it.name }
+        val ellipsis = if (files.size > 5) ", … (+${files.size - 5} more)" else ""
+        thisLogger().info("[ComposePreview] VFS change: ${files.size} .kt file(s): $preview$ellipsis")
 
         val target = previewService.lastRenderTarget()
         if (target == null) {
@@ -110,7 +113,7 @@ class HotReloadCoordinator(private val project: Project) : Disposable {
 
     private fun scheduleRebuild(target: PreviewService.RenderTarget) {
         debounceJob?.cancel()
-        debounceJob = scope.launch {
+        debounceJob = cs.launch(Dispatchers.IO) {
             // 500ms debounce — coalesces bursts of saves into one compile.
             delay(500)
             triggerCompileThenRerender(target)
@@ -128,7 +131,7 @@ class HotReloadCoordinator(private val project: Project) : Disposable {
      * consistent build regardless of IDE version.
      */
     private fun triggerCompileThenRerender(target: PreviewService.RenderTarget) {
-        scope.launch {
+        cs.launch(Dispatchers.IO) {
             val module = target.resolveModule(project)
             if (module == null) {
                 thisLogger().warn("[ComposePreview] cannot resolve module ${target.moduleName}")
@@ -179,7 +182,7 @@ class HotReloadCoordinator(private val project: Project) : Disposable {
      *     will prime the snapshot for next time.
      */
     private fun attemptHotSwapOrFallback(target: PreviewService.RenderTarget) {
-        scope.launch {
+        cs.launch(Dispatchers.IO) {
             if (!previewService.isSnapshotPrimed()) {
                 thisLogger().info("[ComposePreview] snapshot not primed → full rerender")
                 previewService.rerenderLast()
@@ -213,10 +216,14 @@ class HotReloadCoordinator(private val project: Project) : Disposable {
                 is RendererProcess.Outcome.Success -> {
                     thisLogger().info("[ComposePreview] hot-swap SUCCESS — state preserved")
                     val r = outcome.result
-                    ApplicationManager.getApplication().invokeLater {
-                        // Reuse PreviewService's panel via showImage helper.
-                        previewService.showImageDirect(target.fqn, r.pngBase64, r.widthPx, r.heightPx)
-                    }
+                    ApplicationManager.getApplication().invokeLater(
+                        {
+                            // Reuse PreviewService's panel via showImage helper.
+                            previewService.showImageDirect(target.fqn, r.pngBase64, r.widthPx, r.heightPx)
+                        },
+                        ModalityState.defaultModalityState(),
+                        project.disposed,
+                    )
                 }
                 is RendererProcess.Outcome.Errored -> {
                     if (outcome.error.kind == ErrorKind.HOT_SWAP_FAILED) {

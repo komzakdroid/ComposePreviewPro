@@ -6,6 +6,149 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.3.7] — 2026-05-29
+
+### Changed
+- **Hot-reload agent loads via `-javaagent:` at JVM startup** instead of
+  self-attach via the Attach API. JEP 451 (finalised in JDK 21) prints a
+  warning on every dynamic agent load and a future JDK will make it fail
+  by default. The Gradle `application` plugin's start-script template
+  wraps `DEFAULT_JVM_OPTS` in single quotes (POSIX) and re-escapes `$`
+  through its `printf | xargs | sed | eval` pipeline, so a literal
+  `$APP_HOME` survives unexpanded. The workaround in
+  `renderer/build.gradle.kts` injects a *second*, double-quoted
+  `DEFAULT_JVM_OPTS` line in `startScripts.doLast`, prepending the
+  `-javaagent:` flag with `$APP_HOME` expanded at runtime (verified
+  empirically — the JVM resolves the agent JAR by absolute path before
+  `main`). Self-attach via the Attach API remains a fallback for paths
+  where the start-script injection cannot be honoured (manual
+  `java -cp …` invocation, Mockito's inline mock maker which uses its
+  own JVMTI attach for the Android Context stub).
+
+- **Compose Multiplatform 1.10 dependency notation.** The
+  `compose.runtime`, `compose.ui`, and `compose.foundation` Gradle DSL
+  accessors were deprecated in CMP 1.10 in favour of explicit Maven
+  coordinates. `:mock-engine` and `:sample` modules now use typed
+  catalog entries (`libs.compose.runtime`, `libs.compose.ui`,
+  `libs.compose.foundation`). Same artifacts resolved, no deprecation
+  warnings on the build log, and the build won't break when the
+  deprecated accessors are removed in CMP 1.11.
+
+### Documented
+- **Remote Dev / JetBrains Gateway posture.** Until a 0.4.x Modular
+  Plugin V2 refactor splits this plugin into `shared` + `frontend`
+  content modules, the platform falls back to loading it on the
+  backend host only — the tool window will not appear in a JetBrains
+  Client connected to a remote backend. The PNG-streaming render path
+  is architecturally remote-friendly already (out-of-process subprocess
+  on the backend, PNG bytes shipped via the tool-window content RPC);
+  the Live-UI mode needs the frontend module split to ship a Compose
+  surface to the client. This is now spelled out in a top-of-file
+  comment in `plugin.xml` rather than left as undocumented behaviour.
+
+### Internal
+- pluginVerifier "Compatible" against IC-243 (2024.3) and IC-252
+  (2025.2) — unchanged from 0.3.6.
+- Hot-reload agent semantics unchanged: same `Instrumentation`
+  reference captured, same hot-swap pipeline, the only delta is the
+  loading mechanism (`premain` vs. runtime `agentmain`).
+
+## [0.3.6] — 2026-05-29
+
+### Changed
+- **IntelliJ Platform Gradle Plugin 2.3.0 → 2.16.0.** Migrated to the
+  typed `create("IC", "...")` verifier API (the old `ide(...)` helper
+  was removed in 2.12). Accommodated the sandbox path move to
+  `.intellijPlatform/sandbox/` (AGP plugin 2.12+). Explicitly pinned
+  the two verifier IDEs so the auto-applied `recommended()` default
+  (new in 2.14) does not surprise the build with an EAP artifact that
+  is not yet resolvable from any Maven repo.
+
+- **Constructor-injected `CoroutineScope` (IJPL-83 contract).**
+  `HotReloadCoordinator` no longer manually constructs
+  `CoroutineScope(SupervisorJob() + Dispatchers.IO)`. The platform
+  injects a scope into the service constructor and cancels it
+  automatically on project close, plugin disable, or IDE shutdown.
+  The VFS message-bus subscription is parented to the same scope via
+  the new `MessageBus.connect(CoroutineScope)` overload, so its
+  teardown happens on the same signal. We no longer implement
+  `Disposable` on this service — there is nothing left to dispose
+  manually.
+
+- **Disposable chain for the live-UI panel.** `LivePreviewPanel`
+  implements `Disposable`, registered as a child of `PreviewPanel`,
+  which is itself parented to the tool window's `Content` disposable
+  in `PreviewToolWindowFactory`. On disposal the panel closes its
+  cached `URLClassLoader` (releasing user project JARs) and the
+  embedded `ComposePanel` (releasing the Skia surface + AWT peer).
+  Without this chain, every project switch leaked one Skiko
+  framebuffer + the entire production classpath of the previous
+  project — visible as monotonically growing memory after a few
+  dozen switches.
+
+- **EDT discipline on the live-UI panel.** `show()` and `clear()`
+  assert `EDT.assertIsEdt()`. Swing widget mutation and
+  `ComposePanel.setContent` are both EDT-only operations, and silent
+  off-EDT calls were a latent crash waiting for a stricter platform
+  release.
+
+- **Explicit `ModalityState` + project-disposed guard on every
+  `invokeLater`.** All twelve panel-update sites in `PreviewService`
+  now route through a single `runOnEdt` helper that pins
+  `ModalityState.defaultModalityState()` and passes `project.disposed`
+  as the runnable's expiration condition. Future modality strictness
+  (planned for 2026.3+) will not silently drop render results, and a
+  render that completes after the project closes is dropped cleanly
+  instead of resurrecting a tearing-down tool window.
+
+### Fixed
+- **Bounded log allocation in hot reload.** The "VFS change" log line
+  previously stringified every touched file name —
+  `files.joinToString(", ") { it.name }` — fine for a single-file edit,
+  ruinous for a 4000-file monorepo refactor where a single log call
+  could allocate megabytes that nobody ever reads. Capped at 5 names
+  plus a `(+N more)` ellipsis.
+
+- **Dead service lookup removed.** `PreviewPanel.installInteraction
+  Listeners` had a duplicate `project?.getService(...)` whose result
+  was discarded — Kotlin warned about the unnecessary safe call, but
+  the deeper bug was a no-op service touch inside the mouse handler.
+  Removed.
+
+### Internal
+- pluginVerifier remains "Compatible" against IC-243 (2024.3) and
+  IC-252 (2025.2) with zero deprecated, internal, or experimental API
+  usages flagged — unchanged from 0.3.5.
+
+## [0.3.5] — 2026-05-28
+
+### Fixed
+- **Marketplace verifier 2026.2 EAP blockers.** The previous build flunked the
+  JetBrains Marketplace verifier against IntelliJ IDEA 2026.2 EAP with 1
+  internal-API usage, 4 deprecated-API usages, and 6 experimental-API
+  usages. Two root causes, both addressed without changing user-facing
+  behaviour:
+  - **Internal API.** `RendererProcess.pluginInstallDir()` called
+    `PluginManagerCore.getPlugin(PluginId)`, marked `@ApiStatus.Internal`
+    in 2026.2. The replacement candidates (`PluginManager.findEnabledPlugin`,
+    `PluginManager.getPluginByClass`) are also `@ApiStatus.Internal`, and
+    the blessed public `PluginDetailsService` does not expose `pluginPath`.
+    Switched to self-resolving via `Class.protectionDomain.codeSource` —
+    walks `<plugin-root>/lib/plugin.jar` → `<plugin-root>/`. Pure JVM
+    stdlib, zero Platform API, identical behaviour in sandbox and
+    production installs.
+  - **Deprecated + experimental APIs.** Kotlin (with the default
+    `jvmDefault=enable`) emits a synthetic bridge override for every
+    default method on the Java interfaces we implement. For
+    `ToolWindowFactory` that meant generated bridges for `isApplicable`,
+    `isDoNotActivateOnStart`, `getAnchor`, `getIcon`, `manage`,
+    `isApplicableAsync`, … — each containing an `invokespecial` to the
+    Platform's deprecated/experimental signature, which the verifier
+    counted as a plugin-side usage. Set `jvmDefault=NO_COMPATIBILITY` on
+    the `:plugin` module's Kotlin compiler so the bridges are no longer
+    generated; JVM 8 default-method dispatch resolves the calls at
+    runtime.
+
 ## [0.1.0] — 2026-05-26
 
 ### Added
@@ -41,5 +184,8 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   (`smokeTest`, `ipcIntegrationTest`, `sourceMapperTest`) all run green
   in the meantime.
 
-[Unreleased]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.6...v0.3.7
+[0.3.6]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.5...v0.3.6
+[0.3.5]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.1.0...v0.3.5
 [0.1.0]: https://github.com/komzakdroid/ComposePreviewPro/releases/tag/v0.1.0
