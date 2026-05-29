@@ -6,6 +6,73 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.3.8] — 2026-05-29
+
+### Added
+- **Inline value class auto-mocking.** Composables with parameters like
+  `@JvmInline value class UserId(val id: Long)` used to fall through the
+  whole mock cascade to "No mocker registered" — value classes are
+  neither `data class` nor `sealed`, so none of the structural fallbacks
+  matched. The mock engine now detects `KClass.isValue`, recursively
+  mocks the underlying property type, and invokes the primary
+  constructor to wrap the value. This covers the very common
+  modern-Kotlin pattern of type-safe ID/email/duration wrappers, plus
+  user-defined inline classes for measurement units, currency, etc.
+- Framework value classes (`androidx.compose.ui.graphics.Color`,
+  `kotlin.time.Duration`, `kotlin.UInt`/`ULong`/`UShort`/`UByte`,
+  `kotlin.ranges.*`) are explicitly excluded so the specialised
+  handlers downstream (`ComposeTypeMocks` for Color/Dp/TextUnit/...,
+  `UniversalTypeMocks` for `kotlin.time` and unsigned ints) produce
+  semantically correct instances. Color, for example, is a value class
+  whose ULong packs RGBA + a colour-space index — passing `ULong(42)`
+  to its constructor produces a Color whose `colorSpace` lookup throws
+  `ArrayIndexOutOfBoundsException` deep inside the Skia path; the
+  exclusion list keeps that path safe while the new branch still
+  serves every user-defined inline class.
+
+### Changed
+- **Renderer survives malformed wire messages.** The main loop in
+  `RendererMain` used to `exitProcess(1)` on any uncaught throw —
+  deserialisation failure on a corrupted incoming JSON line, an NPE in
+  a handler, anything. The plugin then saw the pipe close, marked the
+  subprocess Crashed, and respawned a fresh JVM (~3 s of latency); if
+  the offending request was retried verbatim, we entered a permanent
+  restart loop. Each loop iteration now has its own error boundary:
+  deserialisation errors and handler-level throws produce a
+  `PROTOCOL_ERROR` response and the renderer continues serving the
+  next request. Only EOF on stdin (plugin disconnected) and an explicit
+  `Shutdown` exit the loop.
+
+- **Subprocess-death reader thread no longer leaks.** The I/O thread
+  that reads renderer responses with a timeout used to `Thread
+  .interrupt()` itself when the budget was exhausted. That does
+  **not** unblock a thread parked inside `BufferedReader.readLine()`
+  — `readLine()` is a blocking I/O syscall that ignores the Java
+  interrupt flag. The daemon thread survived as long as the JVM did,
+  holding a reference to the dead subprocess's pipe handle. The
+  timeout path now closes the underlying stream from the outside,
+  which makes `readLine()` throw `IOException` and lets the thread
+  terminate cleanly.
+
+### Fixed
+- **Static-init guard around classifier inspection.** Pathological user
+  types whose companion-object init block throws — rare but real on
+  legacy code paths and on classes that read environment / config in a
+  `companion object { init { … } }` — used to bubble the throw out of
+  `type.classifier as? KClass<*>` and abort the entire render. The
+  classifier lookup now lives inside a try/catch; the offending type is
+  reported Unsupported with a clear message and the surrounding
+  composable still renders for the well-behaved arguments.
+
+### Internal
+- 83/83 type-mocking tests stay green (the new inline-value-class branch
+  is regression-safe, and the framework-value-class exclusion list
+  matches the existing `ComposeTypeMocks` coverage exactly).
+- pluginVerifier "Compatible" against IC-243 (2024.3) and IC-252
+  (2025.2) — unchanged from 0.3.7.
+- The Live-UI ComposePanel disposal chain (added in 0.3.6) and the JEP
+  451 `-javaagent:` injection (added in 0.3.7) carry forward unchanged.
+
 ## [0.3.7] — 2026-05-29
 
 ### Changed
@@ -184,7 +251,8 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   (`smokeTest`, `ipcIntegrationTest`, `sourceMapperTest`) all run green
   in the meantime.
 
-[Unreleased]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.1.0...v0.3.5

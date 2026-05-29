@@ -158,7 +158,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "com.composepreviewpro"
         name = "Compose Preview Pro"
-        version = "0.3.7"
+        version = "0.3.8"
 
         // Rich Marketplace description. Rendered as HTML on the listing
         // page (jetbrains.com/marketplace) — break paragraphs with <p>,
@@ -198,6 +198,15 @@ intellijPlatform {
         // in the "Updated" tab of the in-IDE Plugins screen. Keep it short
         // and user-facing; technical detail belongs in CHANGELOG.md.
         changeNotes = """
+            <h4>0.3.8 — Audit-driven hardening: inline value classes, renderer self-healing</h4>
+            <ul>
+              <li><b>Inline value classes are now mockable</b> — composables with parameters like <code>fun Profile(id: UserId)</code> where <code>@JvmInline value class UserId(val id: Long)</code> previously fell through every layer of the mock cascade to "No mocker registered". The mock engine now detects <code>KClass.isValue</code>, recursively mocks the underlying property type, and invokes the primary constructor to wrap the value. Framework value classes (<code>androidx.compose.ui.graphics.Color</code>, <code>kotlin.time.Duration</code>, etc.) are intentionally skipped so the specialised handlers downstream produce semantically correct instances instead of bit-packed garbage that crashes Skia.</li>
+              <li><b>Renderer survives malformed wire messages</b> — a corrupted RenderRequest (truncated base64, protocol-version skew, transient encoder hiccup) used to call <code>exitProcess(1)</code>, the plugin marked the subprocess Crashed, and respawned a fresh JVM (~3 s of latency) only to potentially retry the same broken request. Now each loop iteration has its own error boundary: deserialisation errors and handler-level throws produce a <code>PROTOCOL_ERROR</code> response and the renderer continues serving the next request. Only EOF on stdin and an explicit <code>Shutdown</code> exit the loop.</li>
+              <li><b>Subprocess-death reader unhang</b> — the I/O thread that reads renderer responses with a timeout used to interrupt itself on timeout. <code>Thread.interrupt()</code> does not unblock a thread parked inside <code>BufferedReader.readLine()</code>; the daemon thread stayed alive until JVM exit, holding the dead subprocess's pipe handle. The timeout path now closes the underlying stream from the outside, which makes the readLine() throw <code>IOException</code> and lets the thread terminate cleanly.</li>
+              <li><b>Static-init guard around classifier inspection</b> — pathological user types whose companion-object init throws (rare but real on legacy code paths) used to bubble out of <code>type.classifier as? KClass&lt;*&gt;</code> and abort the entire render. They now report Unsupported with a clear message and the surrounding composable still renders for the well-behaved arguments.</li>
+              <li>Regression-safe: the 83-test type-mocking suite remains all-green, and pluginVerifier stays Compatible against IC-243 + IC-252.</li>
+            </ul>
+
             <h4>0.3.7 — JEP 451 hot-reload, Compose 1.10 dependency notation, remote-dev posture</h4>
             <ul>
               <li><b>Hot-reload agent now loads via <code>-javaagent:</code> at JVM startup</b> instead of self-attach via the Attach API. JDK 21's JEP 451 prints a warning on every self-load and a future JDK will make it fail by default. The Gradle <code>application</code> plugin's start-script template wraps <code>DEFAULT_JVM_OPTS</code> in single quotes (POSIX) and re-escapes <code>$</code> through its <code>printf | xargs | sed | eval</code> pipeline, so a literal <code>${'$'}APP_HOME</code> survives unexpanded — we work around this by injecting a second double-quoted <code>DEFAULT_JVM_OPTS</code> line in <code>startScripts.doLast</code>, prepending the <code>-javaagent:</code> flag with <code>${'$'}APP_HOME</code> properly expanded at runtime. Self-attach remains a fallback for paths where the start-script injection cannot be honoured (manual <code>java -cp …</code>, smoke tests, Mockito's inline mock maker).</li>

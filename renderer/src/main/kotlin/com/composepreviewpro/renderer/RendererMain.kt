@@ -46,19 +46,61 @@ fun main() {
 
     try {
         while (true) {
-            val msg = reader.readNext() ?: break  // EOF
-            when (msg) {
-                is RenderRequest -> handleRender(msg, writer, sessionCache, sourceMapper)
-                is RedefineClasses -> handleRedefine(msg, writer, sessionCache, instrumentation)
-                is Interact -> handleInteract(msg, writer, sessionCache)
-                is Shutdown -> {
-                    System.err.println("[renderer] shutdown: ${msg.reason}")
-                    break
+            // Two error boundaries inside the main loop, each producing
+            // an ErrorResponse + continue instead of killing the process:
+            //
+            //   1. Deserialisation: a malformed JSON line on stdin (e.g.
+            //      the plugin shipped a truncated base64 payload, or a
+            //      protocol-version skew sneaked in a field the wire
+            //      schema cannot decode). Old behaviour was
+            //      exitProcess(1) — the plugin's client then saw the
+            //      pipe close, marked the subprocess Crashed, and
+            //      respawned a fresh JVM. With several thousand kt
+            //      classes that respawn is ~3s of latency, and if the
+            //      offending request was retried verbatim, we entered
+            //      a permanent restart loop.
+            //   2. Handler-throws: any uncaught exception inside a
+            //      RenderRequest / RedefineClasses / Interact handler.
+            //      Composables that throw during composition already
+            //      reach us through ErrorKind.COMPOSABLE_THREW from
+            //      performRender, but a handler-level bug (NPE in our
+            //      glue code, a static-init failure on a user class we
+            //      reflect on, etc.) used to bubble out and kill the
+            //      process. Now it produces a PROTOCOL_ERROR and we
+            //      stay alive for the next request.
+            //
+            // Only EOF on stdin (plugin disconnected) and Shutdown
+            // (plugin asked us to stop) are valid loop-exit conditions.
+            val msg = try {
+                reader.readNext() ?: break  // EOF — plugin disconnected
+            } catch (t: Throwable) {
+                System.err.println("[renderer] PROTOCOL_ERROR while reading: ${t.javaClass.simpleName}: ${t.message}")
+                writer.send(t.toErrorResponse(requestId = null, kind = ErrorKind.PROTOCOL_ERROR))
+                continue
+            }
+            try {
+                when (msg) {
+                    is RenderRequest -> handleRender(msg, writer, sessionCache, sourceMapper)
+                    is RedefineClasses -> handleRedefine(msg, writer, sessionCache, instrumentation)
+                    is Interact -> handleInteract(msg, writer, sessionCache)
+                    is Shutdown -> {
+                        System.err.println("[renderer] shutdown: ${msg.reason}")
+                        break
+                    }
                 }
+            } catch (t: Throwable) {
+                System.err.println("[renderer] handler-level error: ${t.javaClass.simpleName}: ${t.message}")
+                t.printStackTrace(System.err)
+                writer.send(t.toErrorResponse(requestId = null, kind = ErrorKind.PROTOCOL_ERROR))
             }
         }
     } catch (t: Throwable) {
-        writer.send(t.toErrorResponse(requestId = null, kind = ErrorKind.PROTOCOL_ERROR))
+        // Truly unrecoverable — sessionCache failed to clean up, writer
+        // died, etc. We still try to surface the error before exiting so
+        // the plugin gets a final breadcrumb.
+        try {
+            writer.send(t.toErrorResponse(requestId = null, kind = ErrorKind.PROTOCOL_ERROR))
+        } catch (_: Throwable) { /* writer already broken */ }
         exitProcess(1)
     } finally {
         sessionCache.close()

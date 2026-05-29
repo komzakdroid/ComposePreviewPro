@@ -35,6 +35,24 @@ import kotlin.reflect.full.starProjectedType
  */
 object MockEngine {
 
+    /**
+     * Package prefixes whose `value class` types are NOT mocked by
+     * [valueClassMockOrNull]. See its KDoc for why — short version:
+     * framework value classes pack bit fields in ways that random
+     * primitives violate, leading to crashes deep inside Skia / Compose
+     * runtime. We let the renderer's specialised handlers
+     * (`ComposeTypeMocks`, `UniversalTypeMocks`) build correct instances.
+     */
+    private val FRAMEWORK_VALUE_CLASS_PREFIXES = listOf(
+        "androidx.",
+        "kotlin.time.",
+        "kotlin.ranges.",
+        "kotlin.UInt",
+        "kotlin.ULong",
+        "kotlin.UShort",
+        "kotlin.UByte",
+    )
+
     fun mock(type: KType, context: MockContext = MockContext()): MockResult {
         // 1. Nullable shortcut — null is always a valid value for T?.
         //    We prefer it over fabricating a value because user code is
@@ -51,11 +69,23 @@ object MockEngine {
             )
         }
 
-        val classifier = type.classifier as? KClass<*>
-            ?: return MockResult.Unsupported(
+        // Wrap the `classifier as? KClass<*>` cast AND every subsequent
+        // KClass property read in try/catch — pathological user types whose
+        // companion-object or static-init blocks throw at first touch can
+        // bubble out of `type.classifier` and abort the entire render. We
+        // treat such throwers as Unsupported with a clear message rather
+        // than crashing the renderer subprocess.
+        val classifier = try {
+            type.classifier as? KClass<*>
+        } catch (t: Throwable) {
+            return MockResult.Unsupported(
                 type = type,
-                reason = "Type has no KClass classifier (likely a type parameter)."
+                reason = "Type classifier inspection threw: ${t.javaClass.simpleName}: ${t.message}",
             )
+        } ?: return MockResult.Unsupported(
+            type = type,
+            reason = "Type has no KClass classifier (likely a type parameter)."
+        )
 
         // 3. Primitive & String fast path (AI-augmented if context has it).
         primitiveOrNull(classifier, context)?.let {
@@ -89,6 +119,14 @@ object MockEngine {
 
         // 10. Data classes.
         dataClassMockOrNull(classifier, context)?.let { return it }
+
+        // 11. Inline value classes (`@JvmInline value class Foo(val x: Int)`).
+        //     Reflection still sees the wrapper class; at runtime its values
+        //     are erased to the underlying primary-constructor type. We mock
+        //     the underlying value, then invoke the value class's primary
+        //     constructor to wrap it. This handles the very common modern-Kotlin
+        //     pattern of `value class UserId(val id: Long)` parameters.
+        valueClassMockOrNull(classifier, context)?.let { return it }
 
         return MockResult.Unsupported(
             type = type,
@@ -402,6 +440,71 @@ object MockEngine {
             MockResult.Unsupported(
                 type = classifier.starProjectedType,
                 reason = "${classifier.simpleName} constructor threw: ${t.message}",
+            )
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  Inline value class mocking — `@JvmInline value class Foo(val x: T)`
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * Mock a `value class` by recursively mocking its underlying parameter
+     * type and invoking the primary constructor. Returns `null` (so the
+     * dispatcher falls through to the catch-all Unsupported) if the class
+     * is not a value class or has no usable primary constructor.
+     *
+     * Inline classes show up everywhere in modern Kotlin (`UserId`,
+     * `EmailAddress`, `Duration` wrappers, ULID, etc.) and the absence of
+     * this branch was the single most-common reason composables with
+     * type-safe ID parameters fell through to "No mocker registered".
+     *
+     * **Framework value classes are intentionally skipped** so the
+     * specialised handlers downstream (`ComposeTypeMocks`,
+     * `AdvancedTypeMocks`, kotlin.time / kotlin.ranges defaults inside
+     * `UniversalTypeMocks`) get a chance to produce a semantically
+     * meaningful instance. `androidx.compose.ui.graphics.Color`, for
+     * example, is a `value class Color(val value: ULong)` whose
+     * underlying ULong packs RGBA + color-space index — passing `ULong(42)`
+     * to its constructor produces a Color whose colorSpace lookup throws
+     * `ArrayIndexOutOfBoundsException` deep inside the Skia path. Same
+     * shape of bug exists for `kotlin.time.Duration`, `Dp`, `Sp`, `Px`,
+     * `Offset`, `Size`, `IntOffset`, `TextUnit`, etc. We exclude those
+     * package prefixes entirely; user value classes (which never live
+     * under `androidx.*` / `kotlin.*` / `kotlinx.*`) still get the
+     * recursive constructor treatment.
+     */
+    private fun valueClassMockOrNull(classifier: KClass<*>, context: MockContext): MockResult? {
+        if (!classifier.isValue) return null
+        val qn = classifier.qualifiedName
+        if (qn != null && FRAMEWORK_VALUE_CLASS_PREFIXES.any { qn.startsWith(it) }) {
+            return null
+        }
+        val ctor = classifier.primaryConstructor ?: return null
+        val params = ctor.parameters.filter { it.kind == KParameter.Kind.VALUE }
+        // value classes have exactly one underlying property, but treat the
+        // general case so future N-ary value records (Kotlin proposal) keep
+        // working.
+        val args = mutableMapOf<KParameter, Any?>()
+        for (param in params) {
+            val childCtx = context.childWithCaller(param.name, classifier.simpleName ?: "")
+            when (val sub = mock(param.type, childCtx)) {
+                is MockResult.Success -> args[param] = sub.value
+                is MockResult.Unsupported -> {
+                    if (param.isOptional) continue
+                    return MockResult.Unsupported(
+                        type = classifier.starProjectedType,
+                        reason = "cannot mock value class ${classifier.simpleName}.${param.name}: ${sub.reason}",
+                    )
+                }
+            }
+        }
+        return try {
+            MockResult.Success(ctor.callBy(args))
+        } catch (t: Throwable) {
+            MockResult.Unsupported(
+                type = classifier.starProjectedType,
+                reason = "value class ${classifier.simpleName} constructor threw: ${t.message}",
             )
         }
     }

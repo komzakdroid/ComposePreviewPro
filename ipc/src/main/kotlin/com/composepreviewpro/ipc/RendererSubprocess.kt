@@ -179,21 +179,48 @@ class RendererSubprocess(
         process = null
     }
 
+    /**
+     * Read a single response with a timeout. The reader runs on a daemon
+     * thread so the caller's coroutine can give up after [sec] seconds
+     * even if the subprocess has died mid-message and its stdout pipe is
+     * stuck waiting for a byte that will never arrive.
+     *
+     * The previous implementation only called `thread.interrupt()` on
+     * timeout. `Thread.interrupt()` does NOT unblock a thread parked
+     * inside `BufferedReader.readLine()` — that's a blocking I/O syscall
+     * that ignores the Java interrupt flag. The daemon thread stayed
+     * alive until JVM exit, holding a reference to the reader (and
+     * therefore to the dead subprocess's pipe handle).
+     *
+     * The robust fix on timeout is to close the underlying stream from
+     * the OUTSIDE — that makes the read throw `IOException`, unparks the
+     * thread, and lets it terminate cleanly. We also explicitly close
+     * the reader on the success path so a thread that became blocked on
+     * a later readLine() (we already have what we needed) doesn't linger.
+     */
     private fun readWithTimeout(reader: MessageReader<ServerMessage>, sec: Long): ServerMessage? {
         var result: ServerMessage? = null
         var error: Throwable? = null
-        val thread = Thread {
+        val thread = Thread({
             try {
                 result = reader.readNext()
             } catch (t: Throwable) {
                 error = t
             }
-        }
+        }, "renderer-stdin-reader")
         thread.isDaemon = true
         thread.start()
         thread.join(sec * 1000)
         if (thread.isAlive) {
+            // Close the stream from this thread; that unblocks the
+            // daemon's BufferedReader.readLine() with IOException so it
+            // can terminate. Without this the daemon survived as long as
+            // the JVM did.
+            try { reader.close() } catch (_: Throwable) {}
             thread.interrupt()
+            // Give the unblocked thread a moment to clean up; not strictly
+            // necessary for correctness but it makes thread dumps cleaner.
+            thread.join(200)
             return null
         }
         error?.let { throw it }

@@ -129,6 +129,19 @@ This launches a sandbox IDE with the plugin pre-loaded and the sample module rea
 
 ---
 
+## Author
+
+**Komiljon Zokirov** — Android / Kotlin Multiplatform developer based in Tashkent, Uzbekistan. Builds production mobile and KMP applications with a focus on Jetpack Compose, Compose Multiplatform, and developer-tooling that removes friction from day-to-day Compose work. ComposePreviewPro is his answer to one of the longest-running pain points in Compose-on-Android development: the emulator-on-the-critical-path render cycle.
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Komiljon%20Zokirov-0A66C2?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/komiljon-zokirov/)
+[![GitHub](https://img.shields.io/badge/GitHub-komzakdroid-181717?logo=github&logoColor=white)](https://github.com/komzakdroid)
+[![Email](https://img.shields.io/badge/Email-komzak080%40gmail.com-EA4335?logo=gmail&logoColor=white)](mailto:komzak080@gmail.com)
+[![Marketplace](https://img.shields.io/badge/JetBrains%20Marketplace-Compose%20Preview%20Pro-FF318C?logo=jetbrains&logoColor=white)](https://plugins.jetbrains.com/plugin/com.composepreviewpro)
+
+If ComposePreviewPro saves you emulator round-trips, a ⭐ on the [GitHub repo](https://github.com/komzakdroid/ComposePreviewPro) and a follow on LinkedIn are the cheapest way to say thanks. Bug reports, feature requests, and PRs go in the [issue tracker](https://github.com/komzakdroid/ComposePreviewPro/issues).
+
+---
+
 ## License
 
 Apache License 2.0 — see [`LICENSE`](LICENSE).
