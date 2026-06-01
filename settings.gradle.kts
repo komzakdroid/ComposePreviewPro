@@ -33,5 +33,17 @@ include(
     ":renderer",
     ":plugin",
     ":sample",
+    ":sample-designsystem",
     ":hot-reload-agent",
 )
+
+// :sample-android is an AGP test fixture that needs the Android SDK. Only
+// include it when the SDK is present (developer machines) so the CI release
+// build — which has no Android SDK and never touches this module — configures
+// cleanly. The published plugin does not depend on it.
+val androidSdkAvailable = System.getenv("ANDROID_HOME") != null ||
+    System.getenv("ANDROID_SDK_ROOT") != null ||
+    file("local.properties").let { it.exists() && it.readText().contains("sdk.dir") }
+if (androidSdkAvailable) {
+    include(":sample-android")
+}

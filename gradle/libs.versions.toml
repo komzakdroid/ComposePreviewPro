@@ -14,6 +14,10 @@ composeMultiplatform = "1.10.3"
 # Material3 ships on its own cadence within the Compose Multiplatform repo.
 # 1.10.0-alpha05 matches the artifact currently published alongside 1.10.3.
 composeMaterial3 = "1.10.0-alpha05"
+# JetBrains multiplatform port of AndroidX Lifecycle — provides the
+# multiplatform `viewModel()` / `LocalViewModelStoreOwner`. Used only by
+# :sample to exercise the renderer's ViewModel-owner provider on desktop.
+jetbrainsLifecycle = "2.9.1"
 
 # ─────────── KotlinX ───────────
 kotlinxSerialization = "1.9.0"
@@ -24,6 +28,14 @@ kotlinxCoroutines = "1.10.2"
 # Multiplatform 1.10.3 emits the strings into bytecode but does not
 # expose them at runtime; we read them directly off disk instead.
 asm = "9.7"
+
+# ─────────── Android (test fixture only) ───────────
+# AGP + AndroidX Compose for :sample-android — a REAL Android library module
+# whose compiled composables/resources let us validate Android-specific render
+# paths (painterResource(R.drawable), stringResource(R.string), insets) that a
+# desktop sample can't reproduce. 9.2.1 pairs with Gradle 9.4 / Kotlin 2.3.20.
+agp = "9.2.1"
+androidxComposeBom = "2025.06.01"
 
 # ─────────── IntelliJ Platform Plugin ───────────
 # Gradle plugin that builds IDE plugins. Version 2.x is the rewrite
@@ -56,6 +68,13 @@ compose-ui-test = { module = "org.jetbrains.compose.ui:ui-test", version.ref = "
 # ui-tooling-data exposes `asTree()` and `Group`/`SourceLocation` — used by
 # the renderer's inspector to map rendered bounds back to source positions.
 compose-ui-tooling-data = { module = "org.jetbrains.compose.ui:ui-tooling-data", version.ref = "composeMultiplatform" }
+lifecycle-viewmodel-compose = { module = "org.jetbrains.androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "jetbrainsLifecycle" }
+# AndroidX Compose (Android variant) for :sample-android.
+androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "androidxComposeBom" }
+androidx-compose-foundation = { module = "androidx.compose.foundation:foundation" }
+androidx-compose-ui = { module = "androidx.compose.ui:ui" }
+androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
 
 # ASM bytecode parsing — renderer-side only.
 asm-core = { module = "org.ow2.asm:asm", version.ref = "asm" }
@@ -67,3 +86,6 @@ kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", versi
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "composeMultiplatform" }
 intellij-platform = { id = "org.jetbrains.intellij.platform", version.ref = "intellijPlatform" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

@@ -1,0 +1,63 @@
+name: Release
+
+# Builds, verifies, signs, and publishes the plugin to the JetBrains
+# Marketplace when a version tag (e.g. v0.3.9) is pushed. Manual runs are
+# also allowed via the Actions tab (workflow_dispatch).
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   PUBLISH_TOKEN          Marketplace permanent token (Profile → My Tokens)
+#   CERTIFICATE_CHAIN      Full PEM certificate chain used for signing
+#   PRIVATE_KEY            PEM private key matching the chain
+#   PRIVATE_KEY_PASSWORD   Passphrase the private key was encrypted with
+# See https://plugins.jetbrains.com/docs/intellij/plugin-signing.html
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Marketplace release channel (default = Stable)'
+        required: false
+        default: 'default'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Publish to JetBrains Marketplace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Fail fast before publishing if the plugin is not binary-compatible
+      # with the pinned IDE checkpoints (IC-243, IC-252).
+      - name: Verify plugin compatibility
+        run: ./gradlew :plugin:verifyPlugin --no-configuration-cache
+
+      # publishPlugin transitively builds and signs the plugin, then uploads
+      # it. Signing fails loudly if the certificate/key secrets are missing.
+      - name: Sign and publish plugin
+        env:
+          PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          PUBLISH_CHANNEL: ${{ github.event.inputs.channel }}
+          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
+        run: ./gradlew :plugin:publishPlugin --no-configuration-cache

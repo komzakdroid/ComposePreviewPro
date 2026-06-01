@@ -6,6 +6,7 @@ import kotlin.reflect.KClass
 import kotlin.reflect.KParameter
 import kotlin.reflect.KType
 import kotlin.reflect.full.primaryConstructor
+import kotlin.reflect.jvm.isAccessible
 import kotlin.reflect.full.starProjectedType
 
 /**
@@ -127,6 +128,12 @@ object MockEngine {
         //     constructor to wrap it. This handles the very common modern-Kotlin
         //     pattern of `value class UserId(val id: Long)` parameters.
         valueClassMockOrNull(classifier, context)?.let { return it }
+
+        // Last resort before giving up: the renderer's richer layers (Compose
+        // UI types, stdlib, Mockito). Lets a data-class field of a third-party
+        // type (kotlinx.datetime.Instant, etc.) still be fabricated so the
+        // whole data class builds with non-null fields.
+        context.externalMocker?.invoke(type)?.let { return MockResult.Success(it) }
 
         return MockResult.Unsupported(
             type = type,
@@ -417,6 +424,12 @@ object MockEngine {
                 reason = "data class ${classifier.simpleName} has no primary constructor",
             )
 
+        // Real-world data classes routinely have `internal` primary
+        // constructors (NiA's `UserNewsResource`, many domain models). Without
+        // this, callBy throws IllegalAccessException → the class falls back to a
+        // bare mock with null fields → NPE inside the composable.
+        ctor.isAccessible = true
+
         val callerName = classifier.simpleName ?: ""
         val args = mutableMapOf<KParameter, Any?>()
         for (param in ctor.parameters) {
@@ -481,6 +494,7 @@ object MockEngine {
             return null
         }
         val ctor = classifier.primaryConstructor ?: return null
+        ctor.isAccessible = true
         val params = ctor.parameters.filter { it.kind == KParameter.Kind.VALUE }
         // value classes have exactly one underlying property, but treat the
         // general case so future N-ary value records (Kotlin proposal) keep

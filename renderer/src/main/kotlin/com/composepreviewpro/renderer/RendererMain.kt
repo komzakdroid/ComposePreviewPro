@@ -38,6 +38,12 @@ fun main() {
     val instrumentation = AgentLoader.ensureLoaded()
     val agentStatus = if (instrumentation != null) "attached" else "MISSING"
 
+    // Register the framework-native neutraliser BEFORE any render so that the
+    // first time the bundled android-all runtime's classes load (e.g.
+    // android.os.Build via WindowInsets), their `native` methods are already
+    // rewritten to return defaults — no UnsatisfiedLinkError off-device.
+    NativeMethodNeutralizer.installInto(instrumentation)
+
     writer.send(Hello())
     System.err.println("[renderer] up — protocol v1, agent=$agentStatus")
 
@@ -132,46 +138,73 @@ private fun performRender(
     if (req.freshClassLoader) {
         System.err.println("[renderer] forced fresh classloader for ${req.target.fqn}")
     }
+    // Kotlin-reflect path first. When it returns null, fall back to the raw
+    // Java method — this is the value-class-mangled composable case
+    // (`accent: Color`), which kotlin-reflect cannot model at all.
     val fn = resolver.resolve(req.target)
-    if (fn == null) {
-        ErrorResponse(
+    val javaMethod = if (fn == null) resolver.resolveMethod(req.target) else null
+    when {
+        fn == null && javaMethod == null -> ErrorResponse(
             requestId = req.requestId,
             kind = ErrorKind.TARGET_NOT_FOUND,
             message = "Composable ${req.target.fqn} not found on supplied classpath",
         )
-    } else {
-        val aiMocker: ((String, String, String) -> String?)? =
-            if (req.useAiMocks) AiMockClient.FROM_ENV?.let { client -> client::generateString } else null
-        when (val bind = ArgumentBinder(resolver.classLoader, req.argOverrides, aiMocker).bind(fn)) {
-            is ArgumentBinder.BindResult.Failed -> ErrorResponse(
-                requestId = req.requestId,
-                kind = ErrorKind.MOCK_UNSUPPORTED,
-                message = "Cannot mock parameter '${bind.parameter.name}': ${bind.reason}",
+
+        // ── Java path: value-class-mangled composable, no usable KFunction ──
+        fn == null -> {
+            val session = sessionCache.getOrCreateSession(
+                fqn = req.target.fqn,
+                widthPx = req.size.widthPx,
+                heightPx = req.size.heightPx,
+                theme = req.theme,
             )
-            is ArgumentBinder.BindResult.Ready -> {
-                val session = sessionCache.getOrCreateSession(
-                    fqn = req.target.fqn,
-                    widthPx = req.size.widthPx,
-                    heightPx = req.size.heightPx,
-                    theme = req.theme,
-                )
-                // Hand the classpath roots to the session so the
-                // synthetic AssetManager (Android scenarios) can index
-                // compose-resource files outside the URLClassLoader's
-                // direct knowledge.
-                val base64 = session.mount(fn, bind.args, req.classpath.paths)
-                // Parse user classpath ONCE per (classpath signature)
-                // and cache; this is the bridge that lets us pair each
-                // composition slot key with its source file:line.
-                val funcMap = sourceMapper.mapFor(req.classpath.paths)
-                RenderResult(
+            val base64 = session.mountJava(javaMethod!!, req.classpath.paths)
+            val funcMap = sourceMapper.mapFor(req.classpath.paths)
+            RenderResult(
+                requestId = req.requestId,
+                pngBase64 = base64,
+                widthPx = req.size.widthPx,
+                heightPx = req.size.heightPx,
+                paramSummary = JavaComposableInvoker.summarize(javaMethod),
+                hitMap = session.computeHitMap(funcMap),
+            )
+        }
+
+        // ── Kotlin path: usable KFunction → full mock-engine binding ──
+        else -> {
+            val aiMocker: ((String, String, String) -> String?)? =
+                if (req.useAiMocks) AiMockClient.FROM_ENV?.let { client -> client::generateString } else null
+            when (val bind = ArgumentBinder(resolver.classLoader, req.argOverrides, aiMocker).bind(fn)) {
+                is ArgumentBinder.BindResult.Failed -> ErrorResponse(
                     requestId = req.requestId,
-                    pngBase64 = base64,
-                    widthPx = req.size.widthPx,
-                    heightPx = req.size.heightPx,
-                    paramSummary = bind.summary,
-                    hitMap = session.computeHitMap(funcMap),
+                    kind = ErrorKind.MOCK_UNSUPPORTED,
+                    message = "Cannot mock parameter '${bind.parameter.name}': ${bind.reason}",
                 )
+                is ArgumentBinder.BindResult.Ready -> {
+                    val session = sessionCache.getOrCreateSession(
+                        fqn = req.target.fqn,
+                        widthPx = req.size.widthPx,
+                        heightPx = req.size.heightPx,
+                        theme = req.theme,
+                    )
+                    // Hand the classpath roots to the session so the
+                    // synthetic AssetManager (Android scenarios) can index
+                    // compose-resource files outside the URLClassLoader's
+                    // direct knowledge.
+                    val base64 = session.mount(fn, bind.args, req.classpath.paths)
+                    // Parse user classpath ONCE per (classpath signature)
+                    // and cache; this is the bridge that lets us pair each
+                    // composition slot key with its source file:line.
+                    val funcMap = sourceMapper.mapFor(req.classpath.paths)
+                    RenderResult(
+                        requestId = req.requestId,
+                        pngBase64 = base64,
+                        widthPx = req.size.widthPx,
+                        heightPx = req.size.heightPx,
+                        paramSummary = bind.summary,
+                        hitMap = session.computeHitMap(funcMap),
+                    )
+                }
             }
         }
     }

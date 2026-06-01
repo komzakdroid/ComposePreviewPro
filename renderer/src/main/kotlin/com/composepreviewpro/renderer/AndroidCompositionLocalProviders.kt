@@ -3,6 +3,7 @@ package com.composepreviewpro.renderer
 import androidx.compose.runtime.ProvidableCompositionLocal
 import androidx.compose.runtime.ProvidedValue
 import org.mockito.Mockito
+import org.mockito.stubbing.Answer
 import java.lang.reflect.Method
 import java.lang.reflect.ParameterizedType
 import java.lang.reflect.Type
@@ -38,6 +39,18 @@ import java.lang.reflect.Type
  */
 internal object AndroidCompositionLocalProviders {
 
+    /**
+     * CompositionLocals that must be backed by a REAL instance of their target
+     * type (constructed via its no-arg constructor), NOT a Mockito mock. These
+     * are resource caches whose methods do real work — a mock returns null and
+     * breaks painterResource (`resolveResourcePath` → null → NPE). Their own
+     * default throws ("not present"), so we can't skip them either.
+     */
+    private val REAL_INSTANCE_LOCALS = setOf(
+        "LocalResourceIdCache",
+        "LocalImageVectorCache",
+    )
+
     /** Accessor classes scanned for `getLocalXxx` static methods. */
     private val accessorClassNames = listOf(
         "androidx.compose.ui.platform.AndroidCompositionLocals_androidKt",
@@ -66,6 +79,57 @@ internal object AndroidCompositionLocalProviders {
             }
         }
         return provideds
+    }
+
+    /**
+     * Provide `androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner`,
+     * which is a Kotlin `object` (not a top-level `val`) and therefore missed
+     * by the generic `getLocal*` discovery in [discoverAndProvide].
+     *
+     * Called UNIVERSALLY (not Android-gated) by the render host, because
+     * lifecycle-viewmodel-compose is a multiplatform artifact: a desktop/CMP
+     * composable that calls `viewModel()` needs this owner just as much as an
+     * Android one does.
+     *
+     * Its default value throws *"No ViewModelStoreOwner was provided via
+     * LocalViewModelStoreOwner"* the instant any composable calls
+     * `viewModel()` / `koinViewModel()` / `hiltViewModel()`. We bind a stub
+     * owner whose `viewModelStore` is a **real** [androidx.lifecycle.ViewModelStore]:
+     *
+     *   • `viewModel()` previews of a default-constructible ViewModel now
+     *     actually work — the store can cache the created instance.
+     *   • DI-backed `koinViewModel()` / `hiltViewModel()` get past the owner
+     *     lookup and then fail later at DI resolution with a specific message
+     *     that [userFriendlyMessage] maps to actionable guidance, instead of a
+     *     raw CompositionLocal panic at the very first frame.
+     *
+     * Returns null when lifecycle-viewmodel-compose is not on the classpath.
+     */
+    fun provideViewModelStoreOwner(classLoader: ClassLoader): ProvidedValue<*>? {
+        return try {
+            val localClass = classLoader.loadClass(
+                "androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner",
+            )
+            val instance = localClass.getField("INSTANCE").get(null)
+            val ownerType = classLoader.loadClass("androidx.lifecycle.ViewModelStoreOwner")
+            val realStore = classLoader.loadClass("androidx.lifecycle.ViewModelStore")
+                .getDeclaredConstructor().newInstance()
+            val ownerAnswer = Answer<Any?> { invocation ->
+                if (invocation.method.name == "getViewModelStore") realStore else null
+            }
+            val owner = Mockito.mock(
+                ownerType,
+                Mockito.withSettings().defaultAnswer(ownerAnswer).stubOnly(),
+            )
+            // `object LocalViewModelStoreOwner { infix fun provides(owner) }`
+            // → JVM instance method `provides(ViewModelStoreOwner)`.
+            val providesMethod = localClass.methods.firstOrNull {
+                it.name == "provides" && it.parameterCount == 1
+            } ?: return null
+            providesMethod.invoke(instance, owner) as? ProvidedValue<*>
+        } catch (_: Throwable) {
+            null  // viewmodel-compose absent — nothing to provide.
+        }
     }
 
     /**
@@ -103,13 +167,17 @@ internal object AndroidCompositionLocalProviders {
 
         val localName = method.name.removePrefix("get")
         // Resolution order:
-        //   1. Caller override — gives a precise stub (e.g. our Resources
-        //      whose getString returns non-null placeholders so material3
-        //      Text(text = ...) doesn't NPE on @NonNull text param).
+        //   1. Caller override — a precise stub (e.g. our Resources whose
+        //      getString returns non-null placeholders).
         //   2. LocalContext fast-path — always our context stub.
-        //   3. Mockito mock of the Local's declared target type.
+        //   3. Resource caches — a REAL instance (a mock breaks painterResource).
+        //   4. Mockito mock of the Local's declared target type.
         val value = overrides[localName]
-            ?: if (localName == "LocalContext") contextStub else buildMockForLocal(method, classLoader)
+            ?: when {
+                localName == "LocalContext" -> contextStub
+                localName in REAL_INSTANCE_LOCALS -> realInstanceForLocal(method, classLoader)
+                else -> buildMockForLocal(method, classLoader)
+            }
             ?: return null
 
         @Suppress("UNCHECKED_CAST")
@@ -131,6 +199,23 @@ internal object AndroidCompositionLocalProviders {
      * always emits parameterised generic signatures for these) or when
      * Mockito refuses to mock the class (primitive types).
      */
+    /**
+     * Construct a REAL instance of the Local's target type via its no-arg
+     * constructor (e.g. `ResourceIdCache()`, `ImageVectorCache()`), so resource
+     * lookups actually work. Falls back to a Mockito mock if there's no usable
+     * no-arg constructor.
+     */
+    private fun realInstanceForLocal(method: Method, classLoader: ClassLoader): Any? {
+        val genericType = method.genericReturnType as? ParameterizedType ?: return null
+        val targetType: Type = genericType.actualTypeArguments.firstOrNull() ?: return null
+        val targetClass: Class<*> = rawClassOf(targetType, classLoader) ?: return null
+        return try {
+            targetClass.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+        } catch (_: Throwable) {
+            buildMockForLocal(method, classLoader)
+        }
+    }
+
     private fun buildMockForLocal(method: Method, classLoader: ClassLoader): Any? {
         val genericType = method.genericReturnType as? ParameterizedType ?: return null
         val targetType: Type = genericType.actualTypeArguments.firstOrNull() ?: return null

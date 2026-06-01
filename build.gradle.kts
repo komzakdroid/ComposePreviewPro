@@ -11,6 +11,10 @@ plugins {
     alias(libs.plugins.compose.compiler) apply false
     alias(libs.plugins.compose.multiplatform) apply false
     alias(libs.plugins.intellij.platform) apply false
+    // Android test-fixture module (:sample-android). AGP 9 has built-in
+    // Kotlin, so no kotlin.android plugin is applied.
+    alias(libs.plugins.android.library) apply false
+    alias(libs.plugins.android.application) apply false
 }
 
 // Shared JVM toolchain and Kotlin target across all subprojects.

@@ -24,4 +24,10 @@ dependencies {
     implementation(libs.compose.foundation)
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)
+    // Multiplatform `viewModel()` + `LocalViewModelStoreOwner`, so the stress
+    // battery can exercise the renderer's ViewModel-owner provider on desktop.
+    implementation(libs.lifecycle.viewmodel.compose)
+    // Shared design-system module — proves the renderer resolves cross-module
+    // user types, theme CompositionLocals, and widgets (the multi-module shape).
+    implementation(project(":sample-designsystem"))
 }
