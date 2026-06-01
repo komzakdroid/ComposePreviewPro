@@ -314,6 +314,35 @@ intellijPlatform {
             untilBuild = provider { null }
         }
     }
+
+    // Plugin signing — required for JetBrains Marketplace distribution.
+    // Values come from environment variables so no secret material lives in
+    // version control; in CI they map to GitHub Actions repository secrets
+    // (see .github/workflows/release.yml). Generate the chain + key per the
+    // SDK guide: https://plugins.jetbrains.com/docs/intellij/plugin-signing.html
+    //   • CERTIFICATE_CHAIN      — full PEM chain (begins -----BEGIN CERTIFICATE-----)
+    //   • PRIVATE_KEY            — PEM private key (begins -----BEGIN … PRIVATE KEY-----)
+    //   • PRIVATE_KEY_PASSWORD   — passphrase the key was encrypted with
+    // When these are unset (ordinary local `buildPlugin`/`runIde`) the
+    // signPlugin task simply isn't invoked, so day-to-day builds are
+    // unaffected; only `signPlugin`/`publishPlugin` need them.
+    signing {
+        certificateChain = providers.environmentVariable("CERTIFICATE_CHAIN")
+        privateKey = providers.environmentVariable("PRIVATE_KEY")
+        password = providers.environmentVariable("PRIVATE_KEY_PASSWORD")
+    }
+
+    // Marketplace publishing. PUBLISH_TOKEN is a Marketplace permanent token
+    // (Profile → My Tokens). The release channel defaults to "default"
+    // (Stable); set PUBLISH_CHANNEL=beta or =eap to push a pre-release to a
+    // non-stable channel without a code change.
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+        channels = providers.environmentVariable("PUBLISH_CHANNEL")
+            .map { listOf(it) }
+            .orElse(listOf("default"))
+    }
+
     pluginVerification {
         ides {
             // AGP plugin 2.12+ removed the deprecated `ide("IC", "...")`
