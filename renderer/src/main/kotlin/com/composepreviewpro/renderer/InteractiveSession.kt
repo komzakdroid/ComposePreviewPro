@@ -313,18 +313,11 @@ class InteractiveSession(
             javaMethod.isAccessible = true
         }
 
-        val sourceArgs: Array<Any?> = fn.parameters
-            .filter { it.kind == KParameter.Kind.VALUE }
-            .map { args[it] }
-            .toTypedArray()
-
         val composer = currentComposer
-        val jvmArgs = mutableListOf<Any?>()
-        jvmArgs.addAll(sourceArgs)
-        jvmArgs.add(composer)
-        while (jvmArgs.size < javaMethod.parameterCount) {
-            jvmArgs.add(0)
-        }
-        javaMethod.invoke(null, *jvmArgs.toTypedArray())
+        // Shared with OffscreenRenderer: computes the $default bitmask so
+        // omitted parameters use their declared defaults. See
+        // [buildComposableJvmArgs].
+        val jvmArgs = buildComposableJvmArgs(fn, args, composer)
+        javaMethod.invoke(null, *jvmArgs)
     }
 }

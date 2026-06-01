@@ -158,7 +158,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "com.composepreviewpro"
         name = "Compose Preview Pro"
-        version = "0.3.8"
+        version = "0.3.9"
 
         // Rich Marketplace description. Rendered as HTML on the listing
         // page (jetbrains.com/marketplace) — break paragraphs with <p>,
@@ -198,6 +198,16 @@ intellijPlatform {
         // in the "Updated" tab of the in-IDE Plugins screen. Keep it short
         // and user-facing; technical detail belongs in CHANGELOG.md.
         changeNotes = """
+            <h4>0.3.9 — Production-install fixes: renderer launch, default args, smooth scroll</h4>
+            <ul>
+              <li><b>Bundled renderer is found again in real installs.</b> Since 0.3.5 the plugin located its bundled renderer via the JVM <code>CodeSource</code>, but IntelliJ's <code>PluginClassLoader</code> doesn't populate one — so every "Install from Disk" install failed with <i>Renderer launcher not found</i>. Resolution now goes through the plugin's own <code>PluginAwareClassLoader.pluginDescriptor.pluginPath</code> (the JetBrains-recommended self-resolution path), with the <code>CodeSource</code> kept only as a dev fallback. Every lookup miss is now logged instead of failing silently.</li>
+              <li><b>Renderer launches from paths containing spaces.</b> The <code>-javaagent:</code> option injected into the start script wasn't inner-quoted, so a space in the install path (e.g. <code>…/Application Support/…</code>) split the argument and the JVM aborted with <i>Error opening zip file or JAR manifest missing</i> before the IPC handshake. The agent option is now wrapped in escaped quotes the way Gradle encodes its own JVM opts.</li>
+              <li><b>Deterministic renderer JVM.</b> The renderer subprocess now always runs under the IDE's own JBR (the same <code>java.home</code> as the IDE), so it no longer depends on whatever <code>java</code> happens to be on the user's <code>PATH</code> (a Java 17 there previously caused an <code>UnsupportedClassVersionError</code>).</li>
+              <li><b>Default arguments now render correctly.</b> Composables with defaulted parameters — e.g. <code>colors: TopAppBarColors = TopAppBarDefaults.topAppBarColors()</code> — used to render blank because the synthetic Compose <code>${'$'}default</code> bitmask was hard-coded to 0 ("caller supplied everything"), so the author's defaults never applied and a fabricated, transparent value was used instead. The renderer now computes the <code>${'$'}default</code> mask and lets optional parameters fall back to their declared defaults; only <b>required</b> parameters (which carry the content) are auto-mocked. Far higher visual fidelity on real-world Material composables.</li>
+              <li><b>Smooth interactive scroll.</b> Scrolling the preview used to spawn one background task per wheel event — a trackpad flick created hundreds of tasks, each blocking on the renderer's IPC lock, freezing the UI. Scroll events are now coalesced onto a single pump ("one render in flight + one accumulated delta"); clicks are never dropped.</li>
+              <li><b>Clear startup diagnostics + restart on (un)install.</b> A renderer that dies on startup now reports its exit code and stderr tail instead of a cryptic deserialization error. The plugin is also marked <code>require-restart</code>, since it hosts a long-lived subprocess + JVM agent that can't be safely hot-swapped.</li>
+            </ul>
+
             <h4>0.3.8 — Audit-driven hardening: inline value classes, renderer self-healing</h4>
             <ul>
               <li><b>Inline value classes are now mockable</b> — composables with parameters like <code>fun Profile(id: UserId)</code> where <code>@JvmInline value class UserId(val id: Long)</code> previously fell through every layer of the mock cascade to "No mocker registered". The mock engine now detects <code>KClass.isValue</code>, recursively mocks the underlying property type, and invokes the primary constructor to wrap the value. Framework value classes (<code>androidx.compose.ui.graphics.Color</code>, <code>kotlin.time.Duration</code>, etc.) are intentionally skipped so the specialised handlers downstream produce semantically correct instances instead of bit-packed garbage that crashes Skia.</li>

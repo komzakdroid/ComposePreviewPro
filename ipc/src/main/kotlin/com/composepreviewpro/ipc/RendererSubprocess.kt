@@ -2,6 +2,7 @@ package com.composepreviewpro.ipc
 
 import kotlinx.serialization.serializer
 import java.io.File
+import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -47,6 +48,30 @@ class RendererSubprocess(
     private var stderrPump: Thread? = null
 
     /**
+     * Bounded ring of the most recent stderr lines from the current
+     * subprocess. When startup fails, the renderer's JVM-level error
+     * (bad -javaagent path, missing java, OOM, classpath fault) lands
+     * here, and we splice it into the thrown exception so the failure is
+     * self-describing instead of surfacing as a cryptic deserialization
+     * error from a half-spoken protocol stream. Guarded by its own
+     * monitor because the stderr pump thread writes while the launch
+     * thread reads.
+     */
+    private val stderrTail = ArrayDeque<String>()
+
+    private fun recordStderr(line: String) {
+        synchronized(stderrTail) {
+            stderrTail.addLast(line)
+            while (stderrTail.size > STDERR_TAIL_MAX) stderrTail.removeFirst()
+        }
+    }
+
+    private fun stderrTailSnapshot(): String =
+        synchronized(stderrTail) {
+            if (stderrTail.isEmpty()) "(no stderr output)" else stderrTail.joinToString("\n")
+        }
+
+    /**
      * Idempotent. Safe to call repeatedly; only spawns a new process if the
      * previous one has died.
      */
@@ -58,26 +83,52 @@ class RendererSubprocess(
                     "Renderer launcher not executable at: ${launcher.absolutePath}",
                 )
             }
-            val p = ProcessBuilder(launcher.absolutePath)
+            synchronized(stderrTail) { stderrTail.clear() }
+            val pb = ProcessBuilder(launcher.absolutePath)
                 .redirectErrorStream(false)
-                .start()
+            // Pin the renderer to the SAME JVM as this process. Inside the
+            // IDE that's the bundled JBR (Java 21); the renderer + agent are
+            // compiled for 21, so relying on the user's ambient `java` /
+            // JAVA_HOME is a latent UnsupportedClassVersionError (a Java 17
+            // on PATH fails with "class file version 65.0 … up to 61.0").
+            // The Gradle start script honours JAVA_HOME over PATH, so
+            // exporting our own java.home makes the launch deterministic
+            // regardless of the spawning environment.
+            System.getProperty("java.home")?.let { pb.environment()["JAVA_HOME"] = it }
+            val p = pb.start()
             val w = MessageWriter(p.outputStream, serializer<ClientMessage>())
             val r = MessageReader(p.inputStream, serializer<ServerMessage>())
 
             // Pipe stderr to our optional sink so the user can see renderer
-            // diagnostics without us blocking on it.
+            // diagnostics, AND retain a bounded tail for failure reporting.
             stderrPump = Thread {
                 p.errorStream.bufferedReader().useLines { lines ->
-                    lines.forEach { onStderr?.invoke(it) }
+                    lines.forEach { line ->
+                        recordStderr(line)
+                        onStderr?.invoke(line)
+                    }
                 }
             }.apply { isDaemon = true; start() }
 
-            // Mandatory handshake — abort cleanly if the renderer prints
-            // anything other than Hello before its first response.
-            val hello = r.readNext()
+            // Mandatory handshake. The first line on stdout MUST be a Hello.
+            // Anything else — a deserialization fault (the renderer printed
+            // non-protocol text and died), EOF (the JVM exited before
+            // speaking), or a non-Hello message — means startup failed. We
+            // diagnose it richly rather than letting a raw
+            // SerializationException or "got null" bubble up: wait briefly
+            // for the process to report its exit code, and splice in the
+            // captured stderr tail so the true cause (e.g. a bad -javaagent
+            // path) is visible at the call site.
+            val hello: ServerMessage? = try {
+                r.readNext()
+            } catch (t: Throwable) {
+                p.destroyForcibly()
+                throw IllegalStateException(startupFailureMessage(p, "could not parse handshake (${t.message})"), t)
+            }
             if (hello !is Hello) {
-                p.destroy()
-                throw IllegalStateException("Expected Hello from renderer, got: $hello")
+                p.destroyForcibly()
+                val detail = if (hello == null) "stdout closed before handshake" else "expected Hello, got $hello"
+                throw IllegalStateException(startupFailureMessage(p, detail))
             }
 
             process = p
@@ -177,6 +228,31 @@ class RendererSubprocess(
         writer = null
         reader = null
         process = null
+    }
+
+    /**
+     * Build a self-describing startup-failure message: the process exit
+     * code (waited for briefly, since the JVM may still be flushing
+     * stderr when stdout already hit EOF) plus the captured stderr tail.
+     * Turns "Expected JsonObject … JSON input: Error" into something a
+     * user can act on, e.g. "Error opening zip file or JAR manifest
+     * missing : …/Application".
+     */
+    private fun startupFailureMessage(p: Process, detail: String): String {
+        val exited = try { p.waitFor(2, TimeUnit.SECONDS) } catch (_: Throwable) { false }
+        val exitPart =
+            if (exited) "renderer process exited with code ${runCatching { p.exitValue() }.getOrNull()}"
+            else "renderer process still alive but handshake failed"
+        return buildString {
+            append("Renderer failed to start — $detail; $exitPart.\n")
+            append("--- renderer stderr ---\n")
+            append(stderrTailSnapshot())
+        }
+    }
+
+    private companion object {
+        /** Cap on retained stderr lines for failure diagnostics. */
+        const val STDERR_TAIL_MAX = 50
     }
 
     /**

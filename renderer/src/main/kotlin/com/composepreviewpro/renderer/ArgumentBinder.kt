@@ -58,10 +58,32 @@ class ArgumentBinder(
                     )
                     continue
                 }
-                // override existed but failed to parse — fall through to mock
+                // override existed but failed to parse — fall through
             }
 
-            // 2. Auto-mock (AI-augmented if configured).
+            // 2. Optional parameters use their AUTHOR-DECLARED DEFAULT.
+            //    Real-world composables put styling/config/callbacks in
+            //    defaulted params — `colors = TopAppBarDefaults.topAppBarColors()`,
+            //    `modifier = Modifier`, `onClick = {}`. The author's default is
+            //    always visually correct, whereas a fabricated mock (e.g. a
+            //    zeroed `TopAppBarColors`) renders transparent/blank with no
+            //    error. We omit the param from [args]; [buildComposableJvmArgs]
+            //    sets its $default bit so Compose materialises the real default.
+            //    Data still shows because the REQUIRED params (which carry the
+            //    content) are mocked below. Users can populate any optional
+            //    param explicitly via an override.
+            if (param.isOptional) {
+                if (name != null) summary += ParamInfo(
+                    name = name,
+                    typeName = typeName(param.type),
+                    currentValue = "(default)",
+                    editable = isEditableType(param.type),
+                )
+                continue
+            }
+
+            // 3. Required parameter → full auto-mock cascade (AI-augmented if
+            //    configured).
             val ctx = MockContext(
                 paramName = name,
                 classLoader = classLoader,
@@ -158,7 +180,9 @@ class ArgumentBinder(
                         continue
                     }
 
-                    if (param.isOptional) continue
+                    // Reached only for REQUIRED params (optional ones were
+                    // handled above): no layer could fabricate a value and
+                    // there's no default to fall back on — fail the render.
                     return BindResult.Failed(param, res.reason)
                 }
             }

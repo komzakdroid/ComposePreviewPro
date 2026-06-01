@@ -12,12 +12,14 @@ import com.composepreviewpro.ipc.RedefineClasses
 import com.composepreviewpro.ipc.RenderRequest
 import com.composepreviewpro.ipc.RenderResult
 import com.composepreviewpro.ipc.RenderSize
+import com.composepreviewpro.ipc.Scroll
 import com.composepreviewpro.plugin.client.ClasspathSnapshot
 import com.composepreviewpro.plugin.client.RendererProcess
 import com.composepreviewpro.plugin.inspector.CallExpressionInspector
 import com.composepreviewpro.plugin.nav.SourceNavigator
 import com.composepreviewpro.plugin.reload.HotReloadCoordinator
 import com.composepreviewpro.plugin.toolwindow.PreviewPanel
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.Service
@@ -36,6 +38,10 @@ import com.intellij.openapi.wm.ToolWindowManager
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Project-scoped service that orchestrates a render request from the gutter
@@ -53,7 +59,32 @@ import java.util.UUID
  * collaborators that this service drives.
  */
 @Service(Service.Level.PROJECT)
-class PreviewService(private val project: Project) {
+class PreviewService(private val project: Project) : Disposable {
+
+    /**
+     * Single-thread pump for live interactions (click / scroll).
+     *
+     * Scroll events are CONFLATED. A trackpad momentum-scroll fires
+     * dozens-to-hundreds of [MouseWheelEvent]s in a fraction of a second.
+     * The previous code spawned one [Task.Backgroundable] per event — each
+     * registered as a separate background process in the IDE (the "200–300
+     * processes" the user saw) and each blocked on the renderer's single
+     * IPC lock, saturating the thread pool and freezing the EDT. Here a
+     * burst collapses to "at most one render in flight + one accumulated
+     * pending delta": intermediate deltas are summed and rendered as one
+     * frame as fast as the renderer can keep up. Discrete events (click)
+     * are never dropped — they queue on this same single thread so they
+     * serialise correctly with scrolls. Daemon thread; shut in [dispose].
+     */
+    private val interactionPump = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "compose-preview-interaction").apply { isDaemon = true }
+    }
+
+    /** Accumulated, not-yet-sent scroll delta; position tracks the latest event. */
+    private val pendingScroll = AtomicReference<Scroll?>(null)
+
+    /** True while a scroll-drain task is queued/running — keeps it single-flight. */
+    private val scrollDraining = AtomicBoolean(false)
 
     /**
      * Snapshot of the inputs needed to reproduce a render. Held as plain
@@ -549,29 +580,78 @@ class PreviewService(private val project: Project) {
 
     /**
      * Forward a pointer event from the panel into the renderer's live
-     * composition. Runs the IPC call on a background thread and pushes
-     * the new PNG back to the panel on EDT.
+     * composition. Scrolls are coalesced and all events run on the
+     * single-thread [interactionPump]; the resulting PNG is pushed back to
+     * the panel on the EDT. See [interactionPump] for why conflation is
+     * essential (freeze + process storm on fast scroll otherwise).
      */
     fun sendInteraction(event: InputEvent) {
-        val target = lastTarget ?: return
-        ProgressManager.runInBackground(project, "Interacting with preview") {
-            val rendererService = project.getService(RendererProcess::class.java)
-            val request = Interact(requestId = UUID.randomUUID().toString(), event = event)
-            when (val outcome = rendererService.interact(request)) {
-                is RendererProcess.Outcome.Success -> {
-                    val r = outcome.result
-                    runOnEdt {
-                        panel?.showImage(target.fqn, r.pngBase64, r.widthPx, r.heightPx)
+        if (lastTarget == null) return
+        when (event) {
+            is Scroll -> {
+                // Merge consecutive scrolls into one accumulated delta at
+                // the latest cursor position, then ensure a drain is armed.
+                pendingScroll.updateAndGet { prev ->
+                    if (prev == null) event else Scroll(event.x, event.y, prev.deltaY + event.deltaY)
+                }
+                scheduleScrollDrain()
+            }
+            // Discrete events (e.g. Click) must not be dropped: queue them
+            // directly on the same single-thread pump.
+            else -> submitInteraction { runInteraction(event) }
+        }
+    }
+
+    /** Arm a single-flight drain that renders accumulated scroll deltas. */
+    private fun scheduleScrollDrain() {
+        if (scrollDraining.compareAndSet(false, true)) {
+            submitInteraction {
+                try {
+                    while (true) {
+                        val s = pendingScroll.getAndSet(null) ?: break
+                        runInteraction(s)
                     }
-                }
-                is RendererProcess.Outcome.Errored -> {
-                    thisLogger().warn("[ComposePreview] interact errored: ${outcome.error.message}")
-                }
-                is RendererProcess.Outcome.LaunchFailed -> {
-                    thisLogger().warn("[ComposePreview] interact launch failed: ${outcome.reason}")
+                } finally {
+                    scrollDraining.set(false)
+                    // An event may have landed after our last getAndSet but
+                    // before we cleared the flag — re-arm so it isn't lost.
+                    if (pendingScroll.get() != null) scheduleScrollDrain()
                 }
             }
         }
+    }
+
+    private fun submitInteraction(block: () -> Unit) {
+        if (project.isDisposed) return
+        try {
+            interactionPump.submit { if (!project.isDisposed) block() }
+        } catch (_: RejectedExecutionException) {
+            // Pump shut down during project close — drop silently.
+        }
+    }
+
+    private fun runInteraction(event: InputEvent) {
+        val target = lastTarget ?: return
+        val rendererService = project.getService(RendererProcess::class.java)
+        val request = Interact(requestId = UUID.randomUUID().toString(), event = event)
+        when (val outcome = rendererService.interact(request)) {
+            is RendererProcess.Outcome.Success -> {
+                val r = outcome.result
+                runOnEdt {
+                    panel?.showImage(target.fqn, r.pngBase64, r.widthPx, r.heightPx)
+                }
+            }
+            is RendererProcess.Outcome.Errored -> {
+                thisLogger().warn("[ComposePreview] interact errored: ${outcome.error.message}")
+            }
+            is RendererProcess.Outcome.LaunchFailed -> {
+                thisLogger().warn("[ComposePreview] interact launch failed: ${outcome.reason}")
+            }
+        }
+    }
+
+    override fun dispose() {
+        interactionPump.shutdownNow()
     }
 
     /**

@@ -7,6 +7,7 @@ import com.composepreviewpro.ipc.RedefineClasses
 import com.composepreviewpro.ipc.RenderRequest
 import com.composepreviewpro.ipc.RenderResult
 import com.composepreviewpro.ipc.RendererSubprocess
+import com.intellij.ide.plugins.cl.PluginAwareClassLoader
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.thisLogger
@@ -222,23 +223,63 @@ class RendererProcess(private val project: Project) : Disposable {
     /**
      * Resolve the on-disk directory IntelliJ unpacked this plugin into.
      * For sandbox runs (./gradlew :plugin:runIde) that's
-     * `plugin/build/idea-sandbox/.../plugins-prepared/<pluginName>/`.
+     * `.intellijPlatform/sandbox/.../plugins/<pluginName>/`.
      * For a real user install it's somewhere under
      * `~/Library/Application Support/<IDE>/plugins/<pluginName>/` on
      * macOS, or the platform-equivalent path.
      *
-     * We resolve it by inspecting our own [Class.getProtectionDomain]
-     * `CodeSource`. The IDE loads plugin classes from
-     * `<plugin-root>/lib/<jar>.jar`, so the CodeSource location is that
-     * JAR, and walking two `parentFile`s up gives the plugin root.
-     * This avoids `PluginManagerCore.getPlugin(...)` and
-     * `PluginManager.findEnabledPlugin(...)`, both of which are marked
-     * `@ApiStatus.Internal` and flagged by the Marketplace verifier.
+     * Two strategies, in order of reliability:
+     *
+     *   1. **Our own plugin descriptor, via the classloader.** Every
+     *      plugin class is loaded by a `PluginClassLoader`, which
+     *      implements [PluginAwareClassLoader]; its
+     *      `pluginDescriptor.pluginPath` IS the plugin root. This is the
+     *      JetBrains-recommended bridge for self-resolution now that
+     *      `PluginManagerCore.getPlugin(...)` and
+     *      `PluginManager.findEnabledPlugin(...)` are `@ApiStatus.Internal`
+     *      (see platform.jetbrains.com thread 4272). It avoids the
+     *      verifier-flagged APIs while actually working in production.
+     *
+     *   2. **`CodeSource` fallback.** Inspect our own
+     *      [Class.getProtectionDomain] `CodeSource`: the IDE loads plugin
+     *      classes from `<plugin-root>/lib/<jar>.jar`, so the location is
+     *      that JAR and two `parentFile`s up is the plugin root. This was
+     *      the sole strategy in 0.3.5–0.3.8 and SILENTLY returned null in
+     *      every real install, because `PluginClassLoader` does not
+     *      populate a `CodeSource` — the regression that made the bundled
+     *      renderer unreachable ("Renderer launcher not found"). Kept only
+     *      as a backstop for non-plugin classloaders (e.g. unit tests).
+     *
+     * Every miss is logged so this can never again fail silently.
      */
     private fun pluginInstallDir(): File? {
+        // Strategy 1 — classloader → plugin descriptor → install path.
+        val classLoader = RendererProcess::class.java.classLoader
+        if (classLoader is PluginAwareClassLoader) {
+            val path = classLoader.pluginDescriptor?.pluginPath
+            if (path != null) return path.toFile()
+            thisLogger().warn(
+                "[ComposePreview] PluginAwareClassLoader had no pluginPath; " +
+                    "falling back to CodeSource"
+            )
+        } else {
+            thisLogger().info(
+                "[ComposePreview] classloader is not a PluginAwareClassLoader " +
+                    "(${classLoader?.javaClass?.name}); falling back to CodeSource"
+            )
+        }
+
+        // Strategy 2 — CodeSource backstop.
         return try {
-            val source = RendererProcess::class.java.protectionDomain?.codeSource ?: return null
-            val location = source.location ?: return null
+            val source = RendererProcess::class.java.protectionDomain?.codeSource
+            if (source == null) {
+                thisLogger().warn("[ComposePreview] no CodeSource for plugin install dir")
+                return null
+            }
+            val location = source.location ?: run {
+                thisLogger().warn("[ComposePreview] CodeSource had null location")
+                return null
+            }
             // location is a file: URL pointing at .../lib/<plugin>.jar
             val jarFile = File(location.toURI())
             val libDir = jarFile.parentFile ?: return null
