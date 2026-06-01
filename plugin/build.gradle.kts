@@ -158,7 +158,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "com.composepreviewpro"
         name = "Compose Preview Pro"
-        version = "0.3.9"
+        version = "0.4.0"
 
         // Rich Marketplace description. Rendered as HTML on the listing
         // page (jetbrains.com/marketplace) — break paragraphs with <p>,
@@ -198,6 +198,16 @@ intellijPlatform {
         // in the "Updated" tab of the in-IDE Plugins screen. Keep it short
         // and user-facing; technical detail belongs in CHANGELOG.md.
         changeNotes = """
+            <h4>0.4.0 — Render real Android apps off-device: value classes, native runtime, resources</h4>
+            <ul>
+              <li><b>Composables with value-class parameters now render.</b> A parameter like <code>accent: Color</code> (any <code>@JvmInline value class</code>) name-mangles its JVM method and defeats kotlin-reflect entirely. A new pure-Java invocation path reconstructs the Compose calling convention straight from the bytecode, so these composables — extremely common in real design systems — render instead of failing with <i>TARGET_NOT_FOUND</i>.</li>
+              <li><b>Real off-device Android runtime.</b> Android-targeted composables that touch <code>WindowInsets</code>, <code>Build.VERSION</code>, interpolators, etc. used to crash with <code>RuntimeException: Stub!</code>. The renderer now bundles a real Android framework and neutralises its native methods systematically (an ASM class transformer), so the whole <code>android.*</code> surface initialises off-device.</li>
+              <li><b>Android resources.</b> <code>stringResource(R.string.…)</code> and <code>painterResource(R.drawable.…)</code> render (drawables as a clean placeholder vector) instead of NPE-ing.</li>
+              <li><b>Faithful model arguments.</b> Data classes with <code>internal</code> constructors and third-party field types (e.g. <code>kotlinx.datetime.Instant</code>) are now built whole, so <code>Text(model.title)</code> no longer NPEs on a null field.</li>
+              <li><b>Multi-module / shared-UI.</b> Cross-module widgets, theme <code>CompositionLocal</code>s, and types from a separate <code>:core:designsystem</code>-style module resolve from a cold preview.</li>
+              <li><b>Desktop <code>viewModel()</code>.</b> <code>LocalViewModelStoreOwner</code> is provided universally; DI-backed <code>koinViewModel()</code>/<code>hiltViewModel()</code> now surface an actionable "preview the stateless content" message.</li>
+            </ul>
+
             <h4>0.3.9 — Production-install fixes: renderer launch, default args, smooth scroll</h4>
             <ul>
               <li><b>Bundled renderer is found again in real installs.</b> Since 0.3.5 the plugin located its bundled renderer via the JVM <code>CodeSource</code>, but IntelliJ's <code>PluginClassLoader</code> doesn't populate one — so every "Install from Disk" install failed with <i>Renderer launcher not found</i>. Resolution now goes through the plugin's own <code>PluginAwareClassLoader.pluginDescriptor.pluginPath</code> (the JetBrains-recommended self-resolution path), with the <code>CodeSource</code> kept only as a dev fallback. Every lookup miss is now logged instead of failing silently.</li>
