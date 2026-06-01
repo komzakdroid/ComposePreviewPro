@@ -34,5 +34,6 @@ include(
     ":plugin",
     ":sample",
     ":sample-designsystem",
+    ":sample-android",
     ":hot-reload-agent",
 )

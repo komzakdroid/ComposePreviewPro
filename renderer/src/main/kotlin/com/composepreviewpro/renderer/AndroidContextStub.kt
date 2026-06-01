@@ -152,13 +152,17 @@ internal object AndroidContextStub {
             )
             val resourcesMock = mockWith(
                 resourcesClass,
-                ResourcesAnswer(assetManagerMock, configurationStub),
+                ResourcesAnswer(assetManagerMock, configurationStub, userClassLoader),
             )
+            // Single cached Theme instance so ImageVectorCache.Key.hashCode()
+            // (which reads theme.hashCode()) is stable across lookups.
+            val themeStub = AndroidVectorStub.createTheme(userClassLoader)
             val selfHolder = SelfHolder()
             val contextAnswer = ContextAnswer(
                 resources = resourcesMock,
                 assets = assetManagerMock,
                 self = selfHolder,
+                theme = themeStub,
             )
             val contextMock = mockWith(contextClass, contextAnswer)
             selfHolder.value = contextMock
@@ -203,12 +207,14 @@ internal object AndroidContextStub {
         private val resources: Any,
         private val assets: Any,
         private val self: SelfHolder,
+        private val theme: Any?,
     ) : Answer<Any?> {
         override fun answer(invocation: InvocationOnMock): Any? {
             return when (invocation.method.name) {
                 "getApplicationContext", "getBaseContext" -> self.value
                 "getResources" -> resources
                 "getAssets" -> assets
+                "getTheme" -> theme
                 "getPackageName", "getOpPackageName" -> "compose.preview.stub"
                 "getClassLoader" -> Thread.currentThread().contextClassLoader
                 else -> defaultReturnValue(invocation.method.returnType)
@@ -228,12 +234,27 @@ internal object AndroidContextStub {
     private class ResourcesAnswer(
         private val assets: Any,
         private val configuration: Any?,
+        private val classLoader: ClassLoader,
     ) : Answer<Any?> {
         override fun answer(invocation: InvocationOnMock): Any? {
             val name = invocation.method.name
             return when {
                 name == "getAssets" -> assets
                 name == "getConfiguration" -> configuration
+                // painterResource(R.drawable.…) vector pipeline. getValue
+                // populates the TypedValue with a ".xml" path so Compose takes
+                // the vector branch; getXml/obtainAttributes then supply a 24×24
+                // placeholder vector. See [AndroidVectorStub].
+                name == "getValue" -> {
+                    val typedValue = invocation.arguments.getOrNull(1)
+                    val resId = invocation.arguments.firstOrNull() as? Int ?: 0
+                    if (typedValue != null) AndroidVectorStub.populateDrawableTypedValue(typedValue, resId)
+                    null // void
+                }
+                name == "getXml" || name == "getAnimation" || name == "getLayout" ->
+                    AndroidVectorStub.createXmlResourceParser(classLoader)
+                name == "obtainAttributes" -> AndroidVectorStub.createTypedArray(classLoader)
+                name == "obtainTypedArray" -> AndroidVectorStub.createTypedArray(classLoader)
                 // Strings / text — non-null deterministic placeholders.
                 name == "getString" -> {
                     val id = invocation.arguments.firstOrNull() as? Int
@@ -269,12 +290,10 @@ internal object AndroidContextStub {
                 name == "getIdentifier" -> 0
                 // Arrays — empty non-null defaults.
                 name == "getIntArray" -> IntArray(0)
-                name == "obtainTypedArray" -> null
-                name == "obtainAttributes" -> null
                 // Display metrics / display info — Mockito-deep mocks
                 // are fine; renderer doesn't lay out anything that
                 // truly needs density-aware pixel math.
-                name == "getDisplayMetrics" -> null
+                name == "getDisplayMetrics" -> AndroidVectorStub.createDisplayMetrics(classLoader)
                 // Fallback — Mockito default-answer (null for objects,
                 // 0/false for primitives). Composables shouldn't hit
                 // these paths during preview; if they do, the resulting

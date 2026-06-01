@@ -246,6 +246,23 @@ tasks.register<JavaExec>("nativeTest") {
     useBundledAndroidRuntime()
 }
 
+// End-to-end render of REAL Android composables (AGP-compiled :sample-android,
+// AndroidX Compose + R class + resources) — validates stringResource,
+// painterResource(R.drawable), and WindowInsets off-device.
+//   ./gradlew :renderer:androidRenderTest
+tasks.register<JavaExec>("androidRenderTest") {
+    group = "verification"
+    description = "Render real AGP-compiled Android composables through the full path"
+    dependsOn(":sample-android:dumpRenderClasspath")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.composepreviewpro.renderer.AndroidRenderTestKt")
+    workingDir = rootDir
+    standardOutput = System.out
+    errorOutput = System.err
+    jvmArgs("-Djdk.attach.allowAttachSelf=true", "-XX:+EnableDynamicAgentLoading")
+    useBundledAndroidRuntime()
+}
+
 // Hard-mode render battery through the FULL InteractiveSession path:
 // value-class mangling, deep nesting, complex state, lazy lists, viewModel(),
 // interaction, user CompositionLocals. Renders :sample/StressComposables.kt

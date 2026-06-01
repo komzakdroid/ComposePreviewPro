@@ -39,6 +39,18 @@ import java.lang.reflect.Type
  */
 internal object AndroidCompositionLocalProviders {
 
+    /**
+     * CompositionLocals that must be backed by a REAL instance of their target
+     * type (constructed via its no-arg constructor), NOT a Mockito mock. These
+     * are resource caches whose methods do real work — a mock returns null and
+     * breaks painterResource (`resolveResourcePath` → null → NPE). Their own
+     * default throws ("not present"), so we can't skip them either.
+     */
+    private val REAL_INSTANCE_LOCALS = setOf(
+        "LocalResourceIdCache",
+        "LocalImageVectorCache",
+    )
+
     /** Accessor classes scanned for `getLocalXxx` static methods. */
     private val accessorClassNames = listOf(
         "androidx.compose.ui.platform.AndroidCompositionLocals_androidKt",
@@ -155,13 +167,17 @@ internal object AndroidCompositionLocalProviders {
 
         val localName = method.name.removePrefix("get")
         // Resolution order:
-        //   1. Caller override — gives a precise stub (e.g. our Resources
-        //      whose getString returns non-null placeholders so material3
-        //      Text(text = ...) doesn't NPE on @NonNull text param).
+        //   1. Caller override — a precise stub (e.g. our Resources whose
+        //      getString returns non-null placeholders).
         //   2. LocalContext fast-path — always our context stub.
-        //   3. Mockito mock of the Local's declared target type.
+        //   3. Resource caches — a REAL instance (a mock breaks painterResource).
+        //   4. Mockito mock of the Local's declared target type.
         val value = overrides[localName]
-            ?: if (localName == "LocalContext") contextStub else buildMockForLocal(method, classLoader)
+            ?: when {
+                localName == "LocalContext" -> contextStub
+                localName in REAL_INSTANCE_LOCALS -> realInstanceForLocal(method, classLoader)
+                else -> buildMockForLocal(method, classLoader)
+            }
             ?: return null
 
         @Suppress("UNCHECKED_CAST")
@@ -183,6 +199,23 @@ internal object AndroidCompositionLocalProviders {
      * always emits parameterised generic signatures for these) or when
      * Mockito refuses to mock the class (primitive types).
      */
+    /**
+     * Construct a REAL instance of the Local's target type via its no-arg
+     * constructor (e.g. `ResourceIdCache()`, `ImageVectorCache()`), so resource
+     * lookups actually work. Falls back to a Mockito mock if there's no usable
+     * no-arg constructor.
+     */
+    private fun realInstanceForLocal(method: Method, classLoader: ClassLoader): Any? {
+        val genericType = method.genericReturnType as? ParameterizedType ?: return null
+        val targetType: Type = genericType.actualTypeArguments.firstOrNull() ?: return null
+        val targetClass: Class<*> = rawClassOf(targetType, classLoader) ?: return null
+        return try {
+            targetClass.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+        } catch (_: Throwable) {
+            buildMockForLocal(method, classLoader)
+        }
+    }
+
     private fun buildMockForLocal(method: Method, classLoader: ClassLoader): Any? {
         val genericType = method.genericReturnType as? ParameterizedType ?: return null
         val targetType: Type = genericType.actualTypeArguments.firstOrNull() ?: return null
