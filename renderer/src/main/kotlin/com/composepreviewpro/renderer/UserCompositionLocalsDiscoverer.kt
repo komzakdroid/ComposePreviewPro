@@ -3,11 +3,6 @@ package com.composepreviewpro.renderer
 import androidx.compose.runtime.ProvidableCompositionLocal
 import androidx.compose.runtime.ProvidedValue
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.RectangleShape
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.painter.ColorPainter
-import org.mockito.Mockito
-import org.mockito.stubbing.Answer
 import java.io.File
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -165,25 +160,15 @@ internal object UserCompositionLocalsDiscoverer {
         // value class — it produces a broken instance — so use the real
         // canonical default for those before falling back to a Mockito mock
         // of an ordinary class (data class / interface theme bundle).
+        // A plain RETURNS_DEFAULTS mock returns null for every object getter —
+        // fatal for a theme bundle, because `palette.heroGradient` (a non-null
+        // Brush) then NPEs at `Modifier.background(brush)`. SmartMockAnswer
+        // returns sensible non-null values for the common Compose return types
+        // (Brush, Shape, Painter, String, enums). This is the real-app
+        // `LocalAuroraColors` / `LocalAppColors` case.
         val value = knownValueDefault(targetClass)
-            ?: try {
-                // A plain RETURNS_DEFAULTS mock returns null for every object
-                // getter — fatal for a theme bundle, because
-                // `palette.heroGradient` (a non-null Brush) then NPEs at
-                // `Modifier.background(brush)`. ComposeAwareAnswer returns a
-                // sensible non-null value for the common non-null Compose
-                // return types (Brush, Shape, Painter, String) so widgets that
-                // read the bundle render instead of crashing. This is the
-                // real-app `LocalAuroraColors`/`LocalAppColors` case.
-                Mockito.mock(
-                    targetClass,
-                    Mockito.withSettings()
-                        .defaultAnswer(ComposeAwareAnswer)
-                        .stubOnly(),
-                )
-            } catch (_: Throwable) {
-                return null
-            }
+            ?: SmartMockAnswer.mock(targetClass)
+            ?: return null
 
         @Suppress("UNCHECKED_CAST")
         val typedLocal = local as ProvidableCompositionLocal<Any?>
@@ -203,24 +188,6 @@ internal object UserCompositionLocalsDiscoverer {
         "androidx.compose.ui.unit.Dp" -> androidx.compose.ui.unit.Dp.Unspecified
         "androidx.compose.ui.unit.TextUnit" -> androidx.compose.ui.unit.TextUnit.Unspecified
         else -> null
-    }
-
-    /**
-     * Mockito default-answer that fabricates non-null values for the Compose
-     * types a theme bundle commonly exposes as non-null properties. Value-class
-     * getters (Color, Dp) are unboxed to primitives at the JVM level, so
-     * Mockito's `0L` already yields a valid `Color(0)`/`Dp(0)` — only OBJECT
-     * return types need help here. Falls back to Mockito's standard defaults
-     * (null / 0 / false) for everything else.
-     */
-    private val ComposeAwareAnswer = Answer<Any?> { invocation ->
-        when (invocation.method.returnType.name) {
-            "androidx.compose.ui.graphics.Brush" -> SolidColor(Color.Transparent)
-            "androidx.compose.ui.graphics.Shape" -> RectangleShape
-            "androidx.compose.ui.graphics.painter.Painter" -> ColorPainter(Color.Transparent)
-            "java.lang.String", "java.lang.CharSequence" -> ""
-            else -> Mockito.RETURNS_DEFAULTS.answer(invocation)
-        }
     }
 
     private fun rawTargetClass(method: Method, classLoader: ClassLoader): Class<*>? {

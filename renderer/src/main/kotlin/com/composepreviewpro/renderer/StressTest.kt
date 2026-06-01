@@ -59,6 +59,7 @@ fun main() {
         Target("BrandedHeader", "reads a user CompositionLocal with a THROWING default"),
         Target("BrandedHeaderHost", "same Local, self-provided (control)"),
         Target("MixedSignature", "Color + custom value class + defaults (heavy mangling)"),
+        Target("MediaRow", "value-class Color param + data-class param read in Text() (MediaCard shape)"),
         // ── Multi-module / shared-UI: composables in :sample consuming the
         //    separate :sample-designsystem module (widgets, theme Local, types).
         Target("FeatureCardNoTheme", "cross-module GradientCard + cross-module throwing Local", fqn = "$mmPkg.FeatureCardNoTheme"),

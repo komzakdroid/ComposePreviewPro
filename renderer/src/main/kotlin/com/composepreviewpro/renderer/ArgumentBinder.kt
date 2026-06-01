@@ -202,23 +202,8 @@ class ArgumentBinder(
      * decides whether to substitute `null`, an unsupported sentinel,
      * or to give up.
      */
-    private fun mockTypeRecursively(type: KType): Any? {
-        // 1. Pure-Kotlin base layer (primitives, enums, collections,
-        //    sealed hierarchies, data classes).
-        when (val res = MockEngine.mock(type, MockContext(classLoader = classLoader))) {
-            is MockResult.Success -> return res.value
-            is MockResult.Unsupported -> Unit  // fall through
-        }
-        // 2. @Composable lambda → no-op ComposableLambda.
-        ComposableLambdaSynth.tryNoOp(type)?.let { return it }
-        // 3. Compose UI standard types (Color, Dp, ImageVector, …).
-        ComposeTypeMocks.tryDefault(type)?.let { return it }
-        // 4. State/Flow/Lazy/ViewModel — recurses through me again.
-        AdvancedTypeMocks.tryDefault(type, classLoader) { mockTypeRecursively(it) }?.let { return it }
-        // 5. Universal stdlib + Mockito fallback.
-        UniversalTypeMocks.tryDefault(type) { mockTypeRecursively(it) }?.let { return it }
-        return null
-    }
+    private fun mockTypeRecursively(type: KType): Any? =
+        TypeMockCascade.mock(type, classLoader)
 
     private fun parseOverride(raw: String, type: KType): Any? {
         if (type.isMarkedNullable && raw.isBlank()) return null

@@ -290,6 +290,26 @@ fun BrandedHeaderHost() {
     }
 }
 
+// ── 12b. MediaCard shape: value-class Color param (→ Java path) + a
+//        data-class param whose String fields are read inside Text(...).
+//        Reproduces MultiTask's MediaCard: the Java invoker must fabricate a
+//        REAL MediaItem (non-null fileName/url) via the mock cascade, not a
+//        bare Mockito mock that returns null → `Text(text = null)` NPE.
+enum class MediaKind { Image, Video }
+data class MediaItem(val fileName: String, val url: String, val kind: MediaKind)
+
+@Composable
+fun MediaRow(item: MediaItem, accent: Color) {
+    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(item.fileName, style = MaterialTheme.typography.titleSmall, maxLines = 1)
+        Text(item.url, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+        Text(
+            text = if (item.kind == MediaKind.Video) "▶ video" else "▣ image",
+            color = if (accent == Color.Unspecified) Color(0xFF6750A4) else accent,
+        )
+    }
+}
+
 // ── 13. Heavy mangling: Color + custom value class + defaults together ─────
 @Composable
 fun MixedSignature(

@@ -1,10 +1,9 @@
 package com.composepreviewpro.renderer
 
 import com.composepreviewpro.ipc.ParamInfo
-import org.mockito.Answers
-import org.mockito.Mockito
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
+import kotlin.reflect.full.createType
 
 /**
  * Invokes a `@Composable` purely through `java.lang.reflect.Method`, with NO
@@ -150,7 +149,28 @@ internal object JavaComposableInvoker {
         // callbacks do nothing and composable slots emit nothing (no crash).
         type.name.startsWith("kotlin.jvm.functions.Function") -> noOpFunction(type)
         type == java.lang.Object::class.java -> Any()
-        else -> tryMockObject(type)
+        // Ordinary object params (data classes, sealed types, value objects).
+        // The composable FUNCTION is value-class-mangled — hence the Java path
+        // — but each individual param TYPE is itself a normal class, so
+        // kotlin-reflect works on it. Build a KType and run the full mock
+        // cascade so a `data class DownloadableMedia` gets REAL String fields
+        // (a bare Mockito mock returns null → `Text(media.fileName)` NPEs).
+        // Fall back to a smart Mockito mock (non-null String/Brush/enum) when
+        // the cascade can't build the type (e.g. generic with type params).
+        else -> mockViaCascade(type, classLoader) ?: tryMockObject(type)
+    }
+
+    private fun mockViaCascade(type: Class<*>, classLoader: ClassLoader): Any? {
+        val kType = try {
+            type.kotlin.createType(nullable = false)
+        } catch (_: Throwable) {
+            return null // class has type parameters / is non-denotable
+        }
+        return try {
+            TypeMockCascade.mock(kType, classLoader)
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun noOpFunction(functionType: Class<*>): Any =
@@ -164,16 +184,9 @@ internal object JavaComposableInvoker {
             }
         }
 
-    private fun tryMockObject(type: Class<*>): Any? = try {
-        // Mockito's inline mock maker handles final classes (data classes,
-        // sealed leaves) and interfaces; stubOnly keeps it memory-light.
-        Mockito.mock(
-            type,
-            Mockito.withSettings()
-                .defaultAnswer(Answers.RETURNS_DEFAULTS)
-                .stubOnly(),
-        )
-    } catch (_: Throwable) {
-        null
-    }
+    private fun tryMockObject(type: Class<*>): Any? =
+        // SmartMockAnswer returns non-null String/Brush/Shape/enum so the mock
+        // doesn't NPE inside Text(...)/background(...) the way RETURNS_DEFAULTS
+        // (null objects) would.
+        SmartMockAnswer.mock(type)
 }
