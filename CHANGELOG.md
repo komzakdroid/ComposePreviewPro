@@ -6,6 +6,74 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.3.9] — 2026-06-01
+
+### Fixed
+- **Bundled renderer not found in production installs.** Since 0.3.5 the
+  plugin resolved its bundled renderer directory via the JVM
+  `CodeSource` of one of its own classes. IntelliJ's `PluginClassLoader`
+  does not populate a `CodeSource`, so the lookup returned `null` in
+  every real install ("Install Plugin from Disk…") and the plugin failed
+  with *Renderer launcher not found* — while passing in the sandbox,
+  where `runIde` injects `-Dcomposepreviewpro.renderer.home`. Resolution
+  now uses the plugin's own `PluginAwareClassLoader.pluginDescriptor
+  .pluginPath` (the JetBrains-recommended self-resolution bridge now that
+  `PluginManagerCore.getPlugin` is `@ApiStatus.Internal`), with the
+  `CodeSource` retained only as a dev/non-plugin-classloader fallback.
+  Every resolution miss is logged instead of returning `null` silently.
+- **Renderer failed to launch from paths containing spaces.** The
+  `-javaagent:` option injected into the Gradle `application` start
+  script was not wrapped in escaped inner quotes. Gradle's launcher runs
+  `eval "set -- $DEFAULT_JVM_OPTS …"`, which word-splits the value, so a
+  space in the install path (e.g. macOS `…/Application Support/…`) split
+  the option in two — the JVM received `-javaagent:…/Application` and
+  aborted with *Error opening zip file or JAR manifest missing* before
+  the IPC handshake. The option is now encoded the same way Gradle
+  encodes its own default JVM opts, surviving spaces intact.
+- **Composables with default arguments rendered blank.** The Compose
+  compiler emits per-parameter default initialisation guarded by a
+  synthetic `$default` bitmask; the renderer hard-coded that mask to 0
+  ("caller supplied every argument"), so author defaults such as
+  `colors: TopAppBarColors = TopAppBarDefaults.topAppBarColors()` were
+  never applied and a fabricated, transparent value was used instead —
+  rendering, for example, an invisible `TopAppBar` with no error. The
+  renderer now computes the `$default` mask (shared `ComposableInvoker`
+  used by both the offscreen and interactive paths) so omitted parameters
+  fall back to their declared defaults. Verified pixel-exact: the default
+  container colour now appears in the rendered output.
+- **Interactive scroll froze the UI and spawned hundreds of tasks.** Each
+  mouse-wheel event spawned its own `Task.Backgroundable`; a trackpad
+  momentum-scroll created hundreds of background tasks that all blocked
+  on the renderer's single IPC lock and flooded the EDT. Scroll events
+  are now coalesced onto a single-thread pump — at most one render in
+  flight plus one accumulated delta — while discrete events (clicks) are
+  never dropped.
+
+### Changed
+- **Optional parameters use their author-declared defaults, not mocks.**
+  Real-world composables put styling/config/callbacks in defaulted
+  parameters (`colors`, `modifier`, `onClick`); the author's default is
+  always visually correct, whereas a fabricated mock can be blank or
+  garbage. Only **required** parameters — which carry the content — are
+  auto-mocked now. Any optional parameter can still be populated
+  explicitly through the parameter-editor panel.
+- **Renderer subprocess pinned to the IDE's JBR.** The subprocess is
+  spawned with `JAVA_HOME` set to the IDE's own `java.home`, so it runs
+  on the same JVM (JBR 21) as the IDE rather than depending on the
+  ambient `java`/`JAVA_HOME` — a stale Java 17 on `PATH` previously
+  produced an `UnsupportedClassVersionError`.
+- **Plugin now requires an IDE restart on install/update/uninstall**
+  (`require-restart`). It hosts a long-lived out-of-process renderer
+  (Compose Desktop + Skiko native libs) and a JVM agent that cannot be
+  safely hot-swapped; a restart guarantees a clean renderer state and
+  fresh bundled-path resolution.
+
+### Added
+- **Self-describing renderer startup failures.** When the renderer dies
+  during the handshake, the error now includes the process exit code and
+  a tail of its stderr, instead of surfacing as a cryptic
+  `kotlinx.serialization` "Expected JsonObject … JSON input: Error".
+
 ## [0.3.8] — 2026-05-29
 
 ### Added
@@ -251,7 +319,8 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   (`smokeTest`, `ipcIntegrationTest`, `sourceMapperTest`) all run green
   in the meantime.
 
-[Unreleased]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.8...HEAD
+[Unreleased]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.9...HEAD
+[0.3.9]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/komzakdroid/ComposePreviewPro/compare/v0.3.5...v0.3.6

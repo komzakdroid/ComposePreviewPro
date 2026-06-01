@@ -103,8 +103,23 @@ tasks.startScripts {
             val text = unix.readText()
             val anchor = Regex("^DEFAULT_JVM_OPTS=.*$", RegexOption.MULTILINE).find(text)
             if (anchor != null) {
+                // CRITICAL — the whole `-javaagent:…` option must be wrapped
+                // in ESCAPED inner double-quotes inside DEFAULT_JVM_OPTS.
+                // Gradle's start script later runs
+                //   eval "set -- $DEFAULT_JVM_OPTS $JAVA_OPTS …"
+                // which word-splits the value on whitespace. $APP_HOME for a
+                // production install is e.g.
+                //   /Users/<user>/Library/Application Support/Google/…/renderer
+                // — the space in "Application Support" splits the bare option
+                // into `-javaagent:/Users/<user>/Library/Application` and a
+                // stray `Support/…/agent.jar` token, so the JVM aborts with
+                //   Error opening zip file or JAR manifest missing : …/Application
+                // before main() and the IPC handshake never happens. The
+                // escaped-quote form (the same encoding Gradle uses for its
+                // own DEFAULT_JVM_OPTS tokens) keeps the spaced path as ONE
+                // argument through the eval. Do NOT "simplify" the quoting.
                 val injection = "\n# [ComposePreviewPro] JEP 451-safe agent load — prepend before eval pipeline.\n" +
-                    "DEFAULT_JVM_OPTS=\"-javaagent:\$APP_HOME/lib/$agentJar \$DEFAULT_JVM_OPTS\""
+                    "DEFAULT_JVM_OPTS=\"\\\"-javaagent:\$APP_HOME/lib/$agentJar\\\" \$DEFAULT_JVM_OPTS\""
                 unix.writeText(text.substring(0, anchor.range.last + 1) + injection + text.substring(anchor.range.last + 1))
             } else {
                 throw GradleException("startScripts (Unix) — DEFAULT_JVM_OPTS line not found; cannot inject -javaagent:")

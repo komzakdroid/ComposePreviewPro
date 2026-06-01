@@ -1,4 +1,15 @@
-<idea-plugin>
+<idea-plugin require-restart="true">
+    <!-- require-restart="true": force a full IDE restart on install,
+         update, and uninstall. This plugin is NOT safely dynamic — it
+         spawns a long-lived out-of-process renderer (Compose Desktop +
+         Skiko native libraries) and loads a JVM agent. Hot-swapping the
+         plugin classloader without a restart leaves a stale renderer
+         subprocess holding the old bundled `renderer/` dir + native libs,
+         which is exactly the kind of cached half-state that produces
+         "Renderer launcher not found" after an in-place update. A restart
+         guarantees the bundled renderer path is re-resolved against the
+         freshly-unpacked plugin directory. -->
+
     <!-- id, name, vendor, description, change-notes, version, and
          idea-version are populated by the
          `intellijPlatform { pluginConfiguration { … } }` block in

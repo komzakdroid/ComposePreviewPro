@@ -82,34 +82,15 @@ class OffscreenRenderer(
             javaMethod.isAccessible = true
         }
 
-        // Source-level args first, in declaration order.
-        val sourceArgs: Array<Any?> = fn.parameters
-            .filter { it.kind == KParameter.Kind.VALUE }
-            .map { args[it] }
-            .toTypedArray()
-
         // currentComposer is a Compose intrinsic — the compiler rewrites this
         // reference to fetch the active Composer from the surrounding
         // composition. Outside @Composable scope it would throw.
         val composer = currentComposer
 
-        // Compose Compiler appends, in order:
-        //   • Composer  (always)
-        //   • Int $changed  (always, one Int per 10 params; we assume <10)
-        //   • Int $default  (only if the function has parameters with default
-        //                    values; one Int per 32 params with defaults)
-        //
-        // Rather than reasoning about defaults at the language level, we
-        // pad with zeros until the JVM method's expected parameter count is
-        // satisfied. $changed = 0 forces full recomposition on first call;
-        // $default = 0 means "no defaults used, caller provided everything".
-        val jvmArgs = mutableListOf<Any?>()
-        jvmArgs.addAll(sourceArgs)
-        jvmArgs.add(composer)
-        while (jvmArgs.size < javaMethod.parameterCount) {
-            jvmArgs.add(0)
-        }
-
-        javaMethod.invoke(/* static target */ null, *jvmArgs.toTypedArray())
+        // Build the positional JVM args with a correctly-computed $default
+        // bitmask so omitted (defaulted) parameters use their author-declared
+        // defaults rather than null/garbage. See [buildComposableJvmArgs].
+        val jvmArgs = buildComposableJvmArgs(fn, args, composer)
+        javaMethod.invoke(/* static target */ null, *jvmArgs)
     }
 }
