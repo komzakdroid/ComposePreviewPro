@@ -24,18 +24,32 @@ import kotlin.reflect.KType
 internal object TypeMockCascade {
 
     fun mock(type: KType, classLoader: ClassLoader): Any? {
-        // 1. Pure-Kotlin base layer.
-        when (val res = MockEngine.mock(type, MockContext(classLoader = classLoader))) {
+        // 1. Pure-Kotlin base layer. The externalMocker hook lets MockEngine,
+        //    while building a data class, fabricate fields of types only the
+        //    renderer layers know (Compose UI types, kotlinx.datetime, etc.) —
+        //    so the data class builds whole instead of falling back to a
+        //    null-field mock. The hook deliberately excludes MockEngine itself
+        //    to avoid infinite recursion.
+        val ctx = MockContext(
+            classLoader = classLoader,
+            externalMocker = { t -> rendererLayers(t, classLoader) },
+        )
+        when (val res = MockEngine.mock(type, ctx)) {
             is MockResult.Success -> return res.value
             is MockResult.Unsupported -> Unit
         }
-        // 2. @Composable lambda → no-op ComposableLambda.
+        return rendererLayers(type, classLoader)
+    }
+
+    /** The renderer-specific layers only (everything except MockEngine). */
+    private fun rendererLayers(type: KType, classLoader: ClassLoader): Any? {
+        // @Composable lambda → no-op ComposableLambda.
         ComposableLambdaSynth.tryNoOp(type)?.let { return it }
-        // 3. Compose UI standard types (Color, Dp, Brush, …).
+        // Compose UI standard types (Color, Dp, Brush, …).
         ComposeTypeMocks.tryDefault(type)?.let { return it }
-        // 4. State/Flow/Lazy/ViewModel — recurses through me again.
+        // State/Flow/Lazy/ViewModel — inner types recurse through the FULL cascade.
         AdvancedTypeMocks.tryDefault(type, classLoader) { mock(it, classLoader) }?.let { return it }
-        // 5. Universal stdlib + Mockito fallback.
+        // Universal stdlib + Mockito fallback.
         UniversalTypeMocks.tryDefault(type) { mock(it, classLoader) }?.let { return it }
         return null
     }

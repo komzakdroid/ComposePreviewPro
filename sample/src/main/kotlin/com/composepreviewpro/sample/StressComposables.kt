@@ -310,6 +310,39 @@ fun MediaRow(item: MediaItem, accent: Color) {
     }
 }
 
+// ── 12c. Real-world model shape (NiA NewsResourceCardExpanded): a data class
+//        with an INTERNAL primary constructor + a nested data-class list + a
+//        third-party (java.time) field, whose String fields are read inside
+//        Text(...). The mock engine must build a REAL instance (accessible
+//        ctor + externalMocker for java.time), else a null-field fallback NPEs.
+data class Author(val name: String, val handle: String)
+
+data class FeedArticle internal constructor(
+    val id: String,
+    val title: String,
+    val summary: String,
+    val authors: List<Author>,
+    val publishedAt: java.time.Instant,
+    val score: Int,
+) {
+    constructor(title: String) : this("0", title, "", emptyList(), java.time.Instant.EPOCH, 0)
+}
+
+@Composable
+fun FeedArticleCard(article: FeedArticle) {
+    Card(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(article.title, style = MaterialTheme.typography.titleMedium) // NPE if title null
+            Text(article.summary, style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                // NPE if authors null (bare mock) — must be a real (possibly empty) list.
+                article.authors.forEach { Text("· ${it.name}") }
+            }
+            Text("score: ${article.score}", style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
 // ── 13. Heavy mangling: Color + custom value class + defaults together ─────
 @Composable
 fun MixedSignature(

@@ -156,15 +156,8 @@ internal object UniversalTypeMocks {
         if (classifier.qualifiedName?.startsWith("androidx.compose.runtime.") == true) return null
         if (java.isInterface && java.name.startsWith("kotlin.Function")) return null
         if (java.isAnnotation) return null
-        return try {
-            Mockito.mock(
-                java,
-                Mockito.withSettings()
-                    .defaultAnswer(Mockito.RETURNS_DEFAULTS)
-                    .stubOnly(),
-            )
-        } catch (_: Throwable) {
-            null
-        }
+        // SmartMockAnswer returns non-null String/Brush/Shape/enum so a mocked
+        // model's getters don't NPE inside Text(model.title)/background(...).
+        return SmartMockAnswer.mock(java)
     }
 }

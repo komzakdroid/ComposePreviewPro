@@ -33,6 +33,17 @@ data class MockContext(
      * name (`"Booking"`, `"User"`). Improves AI mock realism a lot.
      */
     val callerTypeName: String = "",
+    /**
+     * Escape hatch for types the pure-Kotlin engine has no recipe for
+     * (third-party classes like `kotlinx.datetime.Instant`, Compose UI types,
+     * etc.). The renderer wires this to its richer layers (ComposeTypeMocks /
+     * AdvancedTypeMocks / Mockito) so that a data-class field of such a type is
+     * still fabricated — otherwise the whole data class falls back to a bare
+     * mock with null fields, which NPEs the moment a composable reads
+     * `model.title`. Must NOT call back into [MockEngine] (infinite loop); the
+     * renderer's hook runs only the non-MockEngine layers.
+     */
+    val externalMocker: ((kotlin.reflect.KType) -> Any?)? = null,
 ) {
     fun child(name: String?): MockContext =
         copy(paramName = name, depth = depth + 1)
