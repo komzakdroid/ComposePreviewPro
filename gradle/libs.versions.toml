@@ -14,6 +14,10 @@ composeMultiplatform = "1.10.3"
 # Material3 ships on its own cadence within the Compose Multiplatform repo.
 # 1.10.0-alpha05 matches the artifact currently published alongside 1.10.3.
 composeMaterial3 = "1.10.0-alpha05"
+# JetBrains multiplatform port of AndroidX Lifecycle — provides the
+# multiplatform `viewModel()` / `LocalViewModelStoreOwner`. Used only by
+# :sample to exercise the renderer's ViewModel-owner provider on desktop.
+jetbrainsLifecycle = "2.9.1"
 
 # ─────────── KotlinX ───────────
 kotlinxSerialization = "1.9.0"
@@ -56,6 +60,7 @@ compose-ui-test = { module = "org.jetbrains.compose.ui:ui-test", version.ref = "
 # ui-tooling-data exposes `asTree()` and `Group`/`SourceLocation` — used by
 # the renderer's inspector to map rendered bounds back to source positions.
 compose-ui-tooling-data = { module = "org.jetbrains.compose.ui:ui-tooling-data", version.ref = "composeMultiplatform" }
+lifecycle-viewmodel-compose = { module = "org.jetbrains.androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "jetbrainsLifecycle" }
 
 # ASM bytecode parsing — renderer-side only.
 asm-core = { module = "org.ow2.asm:asm", version.ref = "asm" }

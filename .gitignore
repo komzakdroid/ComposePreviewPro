@@ -14,9 +14,10 @@ local.properties
 **/intellijPlatform/
 .intellijPlatform/
 
-# Smoke / IPC test outputs (regenerated each run)
+# Smoke / IPC / stress test outputs (regenerated each run)
 smoke-out/
 ipc-out/
+stress-out/
 
 # OS / editor scratch
 *.swp

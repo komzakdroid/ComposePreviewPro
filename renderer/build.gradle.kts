@@ -56,6 +56,66 @@ dependencies {
     implementation("org.mockito:mockito-core:5.14.2")
 }
 
+// ── Real Android runtime (off the main classpath) ──────────────────────
+//
+// `org.robolectric:android-all` is the AOSP framework compiled to REAL
+// bytecode — the same jar Robolectric/Paparazzi use to run Android code
+// off-device. The renderer prepends it to the *user-code* classloader at
+// runtime (see ComposableResolver / AndroidRuntimeProvisioner) so that
+// android.* classes resolve to real method bodies instead of the SDK
+// `android.jar` stub's `throw new RuntimeException("Stub!")`.
+//
+// It is deliberately kept OUT of the renderer's own runtime classpath (its
+// own configuration, not `implementation`) so android-all's transitive
+// framework packages (org.json, legacy apache-http, kxml, …) never collide
+// with Skiko / kotlinx on the renderer's parent classloader. We only ship
+// the single jar into the install image and inject it into the child loader.
+//
+// Bump the coordinate to track newer platforms; any published
+// `android-all` (or `android-all-instrumented`) version works.
+val androidRuntime: Configuration by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+
+dependencies {
+    androidRuntime("org.robolectric:android-all:14-robolectric-10818077")
+}
+
+// Bundle the resolved android-all jar into installDist under
+// `$APP_HOME/android-runtime/`, a sibling of `lib/`. AndroidRuntimeProvisioner
+// derives this location from the renderer jar's own code source at runtime.
+distributions {
+    named("main") {
+        contents {
+            from(androidRuntime) {
+                into("android-runtime")
+            }
+        }
+    }
+}
+
+// The in-process verification tasks (smokeTest, typeMockTest) run the
+// renderer on this module's runtimeClasspath, so there is no installDist
+// image to discover the bundled jar in. Point them at the resolved file via
+// the system property AndroidRuntimeProvisioner checks first. Resolution is
+// deferred to execution time so configuring an unrelated task never forces a
+// network fetch of android-all.
+fun JavaExec.useBundledAndroidRuntime() {
+    jvmArgumentProviders.add(
+        CommandLineArgumentProvider {
+            // Keep this key in sync with AndroidRuntimeProvisioner.PROPERTY
+            // (cannot be referenced here — it lives in the module's own source).
+            val jar = androidRuntime.files.firstOrNull { it.name.startsWith("android-all") }
+            if (jar != null) {
+                listOf("-Dcomposepreviewpro.androidRuntimeJar=${jar.absolutePath}")
+            } else {
+                emptyList()
+            }
+        },
+    )
+}
+
 application {
     mainClass.set("com.composepreviewpro.renderer.RendererMainKt")
     applicationDefaultJvmArgs = listOf(
@@ -153,6 +213,50 @@ tasks.register<JavaExec>("smokeTest") {
     workingDir = rootDir
     standardOutput = System.out
     errorOutput = System.err
+    useBundledAndroidRuntime()
+}
+
+// :sample's full runtime classpath (its classes + ALL transitive deps), so
+// the stress battery resolves user-code dependencies — lifecycle-viewmodel-
+// compose, coroutines, etc. — exactly as the plugin's PreviewService does in
+// production. Without this the renderer's URLClassLoader only sees :sample's
+// own classes and ViewModel()/CompositionLocal targets fail to link.
+val sampleRuntimeClasspath: Configuration by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+dependencies {
+    sampleRuntimeClasspath(project(":sample"))
+}
+
+// Hard-mode render battery through the FULL InteractiveSession path:
+// value-class mangling, deep nesting, complex state, lazy lists, viewModel(),
+// interaction, user CompositionLocals. Renders :sample/StressComposables.kt
+// to ./stress-out/*.png.
+//   ./gradlew :renderer:stressTest
+tasks.register<JavaExec>("stressTest") {
+    group = "verification"
+    description = "Render the hard-mode composable battery via InteractiveSession"
+    dependsOn(":sample:classes", ":sample-designsystem:classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.composepreviewpro.renderer.StressTestKt")
+    workingDir = rootDir
+    standardOutput = System.out
+    errorOutput = System.err
+    useBundledAndroidRuntime()
+    // Prepend the design-system module's class-output DIRECTORY (not its jar)
+    // so UserCompositionLocalsDiscoverer — which scans dir roots and skips
+    // jars — can find LocalPalette defined in that separate module. This
+    // mirrors how the plugin's PreviewService adds sibling-module class dirs.
+    val dsClassesDir = project(":sample-designsystem")
+        .layout.buildDirectory.dir("classes/kotlin/main")
+    jvmArgumentProviders.add(
+        CommandLineArgumentProvider {
+            val entries = listOf(dsClassesDir.get().asFile.absolutePath) +
+                sampleRuntimeClasspath.files.map { it.absolutePath }
+            listOf("-DsampleClasspath=${entries.joinToString(File.pathSeparator)}")
+        },
+    )
 }
 
 // Comprehensive test of the type-mocking cascade (MockEngine →
@@ -167,6 +271,7 @@ tasks.register<JavaExec>("typeMockTest") {
     workingDir = rootDir
     standardOutput = System.out
     errorOutput = System.err
+    useBundledAndroidRuntime()
 }
 
 // Unit test for ComposeSourceMapper's classpath-filtering contract.

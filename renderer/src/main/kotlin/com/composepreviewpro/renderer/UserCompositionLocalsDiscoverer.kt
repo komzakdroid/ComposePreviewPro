@@ -2,7 +2,12 @@ package com.composepreviewpro.renderer
 
 import androidx.compose.runtime.ProvidableCompositionLocal
 import androidx.compose.runtime.ProvidedValue
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.painter.ColorPainter
 import org.mockito.Mockito
+import org.mockito.stubbing.Answer
 import java.io.File
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -53,16 +58,6 @@ import java.lang.reflect.Type
  */
 internal object UserCompositionLocalsDiscoverer {
 
-    /**
-     * Class-name suffixes / substrings that strongly suggest a file
-     * containing `CompositionLocal` definitions. Filtering on these
-     * keeps the scan to a manageable handful of class files per
-     * classpath root.
-     */
-    private val likelyHostKeywords = listOf(
-        "Local", "Theme", "Colors", "Color", "Style", "Provider", "Typography",
-    )
-
     fun discover(
         classLoader: ClassLoader,
         classpathRoots: List<String>,
@@ -74,9 +69,16 @@ internal object UserCompositionLocalsDiscoverer {
         for (root in classpathRoots) {
             val rootFile = File(root)
             if (!rootFile.isDirectory) continue  // skip JARs for now
+            // Directory roots ARE the user's own module class-output (jars —
+            // the dependencies — are skipped above). A module's own code is
+            // small (tens–hundreds of files), so we scan every top-level
+            // `*Kt.class` facade rather than keyword-filtering: a user can
+            // declare a CompositionLocal in ANY file, not only `*Theme*` /
+            // `*Color*` ones. The keyword filter was an over-cautious perf
+            // guard that silently missed Locals in plain feature files.
             rootFile.walkTopDown()
-                .filter { it.isFile && it.name.endsWith("Kt.class") && looksLikeLocalHost(it.name) }
-                .take(500)
+                .filter { it.isFile && it.name.endsWith("Kt.class") }
+                .take(2000)
                 .forEach { classFile ->
                     val rel = classFile.toRelativeString(rootFile)
                         .removeSuffix(".class")
@@ -91,8 +93,23 @@ internal object UserCompositionLocalsDiscoverer {
                         return@forEach
                     }
                     classesInspected++
-                    for (method in klass.declaredMethods) {
-                        provideUserLocal(method, classLoader)?.let(provideds::add)
+                    // `declaredMethods` resolves every type in each method's
+                    // signature; a class referencing a type absent from this
+                    // classpath (optional dep, a sibling module not on the
+                    // preview's classpath) throws NoClassDefFoundError here.
+                    // Skip such classes — they simply yield no Locals — rather
+                    // than letting the whole render fail.
+                    val methods = try {
+                        klass.declaredMethods
+                    } catch (_: Throwable) {
+                        return@forEach
+                    }
+                    for (method in methods) {
+                        try {
+                            provideUserLocal(method, classLoader)?.let(provideds::add)
+                        } catch (_: Throwable) {
+                            // One unintrospectable method must not abort the scan.
+                        }
                     }
                 }
         }
@@ -102,9 +119,6 @@ internal object UserCompositionLocalsDiscoverer {
         )
         return provideds
     }
-
-    private fun looksLikeLocalHost(filename: String): Boolean =
-        likelyHostKeywords.any { filename.contains(it, ignoreCase = false) }
 
     private fun isLibraryNamespace(fqn: String): Boolean =
         fqn.startsWith("androidx.") ||
@@ -146,23 +160,66 @@ internal object UserCompositionLocalsDiscoverer {
         val targetClass = rawTargetClass(method, classLoader) ?: return null
         if (targetClass.isPrimitive) return null
 
-        val mock = try {
-            Mockito.mock(
-                targetClass,
-                Mockito.withSettings()
-                    .defaultAnswer(Mockito.RETURNS_DEFAULTS)
-                    .stubOnly(),
-            )
-        } catch (_: Throwable) {
-            return null
-        }
+        // Value-class-typed Locals (e.g. `compositionLocalOf<Color>`,
+        // `<Dp>`) are common in design systems. Mockito cannot mock a Kotlin
+        // value class — it produces a broken instance — so use the real
+        // canonical default for those before falling back to a Mockito mock
+        // of an ordinary class (data class / interface theme bundle).
+        val value = knownValueDefault(targetClass)
+            ?: try {
+                // A plain RETURNS_DEFAULTS mock returns null for every object
+                // getter — fatal for a theme bundle, because
+                // `palette.heroGradient` (a non-null Brush) then NPEs at
+                // `Modifier.background(brush)`. ComposeAwareAnswer returns a
+                // sensible non-null value for the common non-null Compose
+                // return types (Brush, Shape, Painter, String) so widgets that
+                // read the bundle render instead of crashing. This is the
+                // real-app `LocalAuroraColors`/`LocalAppColors` case.
+                Mockito.mock(
+                    targetClass,
+                    Mockito.withSettings()
+                        .defaultAnswer(ComposeAwareAnswer)
+                        .stubOnly(),
+                )
+            } catch (_: Throwable) {
+                return null
+            }
 
         @Suppress("UNCHECKED_CAST")
         val typedLocal = local as ProvidableCompositionLocal<Any?>
         return try {
-            typedLocal provides mock
+            typedLocal provides value
         } catch (_: Throwable) {
             null
+        }
+    }
+
+    /**
+     * Canonical default for Compose value-class types that Mockito cannot
+     * fabricate. Returns null for ordinary classes (handled by Mockito).
+     */
+    private fun knownValueDefault(targetClass: Class<*>): Any? = when (targetClass.name) {
+        "androidx.compose.ui.graphics.Color" -> Color.Unspecified
+        "androidx.compose.ui.unit.Dp" -> androidx.compose.ui.unit.Dp.Unspecified
+        "androidx.compose.ui.unit.TextUnit" -> androidx.compose.ui.unit.TextUnit.Unspecified
+        else -> null
+    }
+
+    /**
+     * Mockito default-answer that fabricates non-null values for the Compose
+     * types a theme bundle commonly exposes as non-null properties. Value-class
+     * getters (Color, Dp) are unboxed to primitives at the JVM level, so
+     * Mockito's `0L` already yields a valid `Color(0)`/`Dp(0)` — only OBJECT
+     * return types need help here. Falls back to Mockito's standard defaults
+     * (null / 0 / false) for everything else.
+     */
+    private val ComposeAwareAnswer = Answer<Any?> { invocation ->
+        when (invocation.method.returnType.name) {
+            "androidx.compose.ui.graphics.Brush" -> SolidColor(Color.Transparent)
+            "androidx.compose.ui.graphics.Shape" -> RectangleShape
+            "androidx.compose.ui.graphics.painter.Painter" -> ColorPainter(Color.Transparent)
+            "java.lang.String", "java.lang.CharSequence" -> ""
+            else -> Mockito.RETURNS_DEFAULTS.answer(invocation)
         }
     }
 

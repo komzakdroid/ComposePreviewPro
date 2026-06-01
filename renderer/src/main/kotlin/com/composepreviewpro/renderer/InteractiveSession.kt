@@ -72,23 +72,59 @@ class InteractiveSession(
         args: Map<KParameter, Any?>,
         classpathPaths: List<String> = emptyList(),
     ): String {
-        // Fresh inspection table per mount — old composition data is
-        // stale once the content lambda changes.
-        inspectionTables = mutableSetOf()
-        // If the user code was compiled for Android (typical for KMP
-        // projects that target only androidMain + iOS), Compose
-        // Multiplatform Resources's stringResource/painterResource will
-        // read LocalContext.current and crash with "LocalContext not
-        // present". Synthesise a Context stub on the user's classloader
-        // and provide it via CompositionLocalProvider so the read
-        // succeeds. The collectedProvidedValues list is empty when no
-        // Android runtime is in scope.
         val userClassLoader: ClassLoader = fn.javaMethod?.declaringClass?.classLoader
             ?: Thread.currentThread().contextClassLoader
-        val providedValues = buildAndroidLocalContextProvidedValues(userClassLoader, classpathPaths)
+        return mountContent(userClassLoader, classpathPaths) {
+            InvokeComposable(fn, args)
+        }
+    }
+
+    /**
+     * Java-path mount for composables kotlin-reflect cannot model — primarily
+     * those taking an inline **value class** parameter (`accent: Color`),
+     * whose JVM method is name-mangled and value-unboxed. [method] is the raw
+     * mangled `Method` from [ComposableResolver.resolveMethod]; arguments
+     * (incl. Composer / `$changed` / `$default`) are reconstructed from the
+     * JVM signature by [JavaComposableInvoker], with no `KFunction` involved.
+     */
+    @OptIn(InternalComposeApi::class)
+    fun mountJava(
+        method: java.lang.reflect.Method,
+        classpathPaths: List<String> = emptyList(),
+    ): String {
+        val userClassLoader: ClassLoader = method.declaringClass.classLoader
+            ?: Thread.currentThread().contextClassLoader
+        if (!method.canAccess(null)) method.isAccessible = true
+        return mountContent(userClassLoader, classpathPaths) {
+            InvokeJava(method, userClassLoader)
+        }
+    }
+
+    /**
+     * Shared mount scaffold: fresh inspection table, the full
+     * CompositionLocal provider stack (Android Context stub when present,
+     * ViewModel owner, user theme Locals), the outer MaterialTheme, then the
+     * caller-supplied [content]. Both [mount] and [mountJava] route through
+     * here so the two invocation strategies share identical setup.
+     */
+    @OptIn(InternalComposeApi::class)
+    private fun mountContent(
+        userClassLoader: ClassLoader,
+        classpathPaths: List<String>,
+        content: @Composable () -> Unit,
+    ): String {
+        // Fresh inspection table per mount — old composition data is stale
+        // once the content lambda changes.
+        inspectionTables = mutableSetOf()
+        // If the user code was compiled for Android (typical for KMP projects
+        // targeting only androidMain + iOS), Compose Multiplatform Resources'
+        // stringResource/painterResource reads LocalContext.current and would
+        // crash with "LocalContext not present". The provider stack below
+        // synthesises a Context graph and binds the long tail of Android +
+        // multiplatform CompositionLocals so those reads succeed.
+        val providedValues = buildProvidedValues(userClassLoader, classpathPaths)
         System.err.println(
-            "[InteractiveSession] mount: providedValues=${providedValues.size} " +
-                "(0 means non-Android scenario or stub failed)",
+            "[InteractiveSession] mount: providedValues=${providedValues.size}",
         )
 
         scene.setContent {
@@ -97,12 +133,10 @@ class InteractiveSession(
                 LocalInspectionTables provides inspectionTables,
             ) {
                 captureComposerData()
-                // INLINE provide: the LocalContext provider chain has
-                // to be in the SAME @Composable scope as the user's
-                // composable, with no wrapping helper function between
-                // them. We pass the array of ProvidedValue's directly
-                // to CompositionLocalProvider — its vararg overload
-                // accepts whatever we hand it.
+                // INLINE provide: the LocalContext provider chain must be in
+                // the SAME @Composable scope as the user's composable, with no
+                // wrapping helper function between them. The vararg overload
+                // accepts the array we hand it.
                 CompositionLocalProvider(values = providedValues.toTypedArray()) {
                     MaterialTheme(
                         colorScheme = when (theme) {
@@ -110,7 +144,7 @@ class InteractiveSession(
                             PreviewTheme.DARK -> darkColorScheme()
                         },
                     ) {
-                        InvokeComposable(fn, args)
+                        content()
                     }
                 }
             }
@@ -153,51 +187,58 @@ class InteractiveSession(
      * domain-aware Context stub so that asset reads can route through
      * the user's classpath.
      */
-    private fun buildAndroidLocalContextProvidedValues(
+    private fun buildProvidedValues(
         classLoader: ClassLoader,
         classpathPaths: List<String>,
     ): List<androidx.compose.runtime.ProvidedValue<*>> {
-        val graph = AndroidContextStub.createGraphOrNull(classLoader, classpathPaths)
-            ?: return emptyList()
-        // Build a Local-name → value override map so LocalResources and
-        // LocalConfiguration resolve to OUR domain-aware stubs instead
-        // of generic Mockito mocks. Critical because:
-        //
-        //   • `stringResource()` reads LocalResources.current.getString(id).
-        //     A generic Mockito Resources returns null, which then NPEs
-        //     when material3 Text(text: String!) parameter contract
-        //     rejects null.
-        //
-        //   • `LocalConfiguration` is checked by stringResource() to
-        //     force recomposition; using a real Configuration object
-        //     (no-arg ctor, perfectly valid) keeps locale lookups
-        //     consistent across recompositions.
-        val overrides = buildMap {
-            put("LocalResources", graph.resources)
-            graph.configuration?.let { put("LocalConfiguration", it) }
-        }
-        val androidProvideds = AndroidCompositionLocalProviders.discoverAndProvide(
-            classLoader = classLoader,
-            contextStub = graph.context,
-            overrides = overrides,
-        )
-        // ALSO discover user-defined CompositionLocals in their classpath.
-        // Real-world apps define their own theme-shaped Locals
-        // (LocalAuroraColors, LocalAppColors, LocalTypography, …) whose
-        // default factory throws unless the user wraps the composable
-        // in their app theme. We provide each with a Mockito mock so
-        // the preview renders something instead of crashing — Compose
-        // tolerates the mock's `0`/`null` defaults well enough for
-        // layout & paint.
-        val userProvideds = UserCompositionLocalsDiscoverer.discover(
+        val provideds = mutableListOf<androidx.compose.runtime.ProvidedValue<*>>()
+
+        // (1) Multiplatform owner — `LocalViewModelStoreOwner`. lifecycle-
+        // viewmodel-compose is a multiplatform artifact, so a desktop/CMP
+        // composable calling `viewModel()` needs this just as much as an
+        // Android one. NOT Android-gated (it used to be, which left desktop
+        // `viewModel()` previews crashing with "No ViewModelStoreOwner").
+        AndroidCompositionLocalProviders.provideViewModelStoreOwner(classLoader)
+            ?.let(provideds::add)
+
+        // (2) User-defined theme Locals (LocalAuroraColors, LocalAppColors,
+        // LocalTypography, …) whose default factory throws unless the user
+        // wraps the composable in their app theme. We provide each with a
+        // Mockito mock so the preview renders instead of crashing — Compose
+        // tolerates the mock's `0`/`null` defaults for layout & paint.
+        // Universal: applies to desktop and Android alike.
+        provideds += UserCompositionLocalsDiscoverer.discover(
             classLoader = classLoader,
             classpathRoots = classpathPaths,
         )
-        val provideds = androidProvideds + userProvideds
+
+        // (3) Android-only Context graph + `getLocal*` scan. Skipped entirely
+        // for pure desktop/CMP classpaths where android.content.Context is
+        // absent. Provides LocalContext (asset-aware stub), LocalResources,
+        // LocalConfiguration, LocalView, LocalLifecycleOwner, etc.
+        //
+        // LocalResources/LocalConfiguration get OUR domain-aware overrides:
+        //   • `stringResource()` reads LocalResources.current.getString(id);
+        //     a generic Mockito Resources returns null → material3
+        //     Text(text: String!) NPEs. Our stub returns non-null.
+        //   • `LocalConfiguration` is read by stringResource() to force
+        //     recomposition; a real Configuration keeps locale lookups stable.
+        val graph = AndroidContextStub.createGraphOrNull(classLoader, classpathPaths)
+        if (graph != null) {
+            val overrides = buildMap {
+                put("LocalResources", graph.resources)
+                graph.configuration?.let { put("LocalConfiguration", it) }
+            }
+            provideds += AndroidCompositionLocalProviders.discoverAndProvide(
+                classLoader = classLoader,
+                contextStub = graph.context,
+                overrides = overrides,
+            )
+        }
+
         System.err.println(
             "[InteractiveSession] provided ${provideds.size} CompositionLocals " +
-                "(android=${androidProvideds.size}, user=${userProvideds.size}, " +
-                "${overrides.size} named overrides)",
+                "(androidContext=${graph != null})",
         )
         return provideds
     }
@@ -319,5 +360,18 @@ class InteractiveSession(
         // [buildComposableJvmArgs].
         val jvmArgs = buildComposableJvmArgs(fn, args, composer)
         javaMethod.invoke(null, *jvmArgs)
+    }
+
+    /**
+     * Pure-Java invocation for value-class-mangled composables (no KFunction).
+     * [JavaComposableInvoker] rebuilds the positional args — including the
+     * Composer / `$changed` / `$default` synthetics — straight from the JVM
+     * signature.
+     */
+    @Composable
+    private fun InvokeJava(method: java.lang.reflect.Method, classLoader: ClassLoader) {
+        val composer = currentComposer
+        val jvmArgs = JavaComposableInvoker.buildJvmArgs(method, classLoader, composer)
+        method.invoke(null, *jvmArgs)
     }
 }

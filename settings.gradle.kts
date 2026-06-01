@@ -33,5 +33,6 @@ include(
     ":renderer",
     ":plugin",
     ":sample",
+    ":sample-designsystem",
     ":hot-reload-agent",
 )

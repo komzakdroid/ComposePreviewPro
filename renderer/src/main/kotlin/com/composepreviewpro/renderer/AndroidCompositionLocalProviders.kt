@@ -3,6 +3,7 @@ package com.composepreviewpro.renderer
 import androidx.compose.runtime.ProvidableCompositionLocal
 import androidx.compose.runtime.ProvidedValue
 import org.mockito.Mockito
+import org.mockito.stubbing.Answer
 import java.lang.reflect.Method
 import java.lang.reflect.ParameterizedType
 import java.lang.reflect.Type
@@ -66,6 +67,57 @@ internal object AndroidCompositionLocalProviders {
             }
         }
         return provideds
+    }
+
+    /**
+     * Provide `androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner`,
+     * which is a Kotlin `object` (not a top-level `val`) and therefore missed
+     * by the generic `getLocal*` discovery in [discoverAndProvide].
+     *
+     * Called UNIVERSALLY (not Android-gated) by the render host, because
+     * lifecycle-viewmodel-compose is a multiplatform artifact: a desktop/CMP
+     * composable that calls `viewModel()` needs this owner just as much as an
+     * Android one does.
+     *
+     * Its default value throws *"No ViewModelStoreOwner was provided via
+     * LocalViewModelStoreOwner"* the instant any composable calls
+     * `viewModel()` / `koinViewModel()` / `hiltViewModel()`. We bind a stub
+     * owner whose `viewModelStore` is a **real** [androidx.lifecycle.ViewModelStore]:
+     *
+     *   • `viewModel()` previews of a default-constructible ViewModel now
+     *     actually work — the store can cache the created instance.
+     *   • DI-backed `koinViewModel()` / `hiltViewModel()` get past the owner
+     *     lookup and then fail later at DI resolution with a specific message
+     *     that [userFriendlyMessage] maps to actionable guidance, instead of a
+     *     raw CompositionLocal panic at the very first frame.
+     *
+     * Returns null when lifecycle-viewmodel-compose is not on the classpath.
+     */
+    fun provideViewModelStoreOwner(classLoader: ClassLoader): ProvidedValue<*>? {
+        return try {
+            val localClass = classLoader.loadClass(
+                "androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner",
+            )
+            val instance = localClass.getField("INSTANCE").get(null)
+            val ownerType = classLoader.loadClass("androidx.lifecycle.ViewModelStoreOwner")
+            val realStore = classLoader.loadClass("androidx.lifecycle.ViewModelStore")
+                .getDeclaredConstructor().newInstance()
+            val ownerAnswer = Answer<Any?> { invocation ->
+                if (invocation.method.name == "getViewModelStore") realStore else null
+            }
+            val owner = Mockito.mock(
+                ownerType,
+                Mockito.withSettings().defaultAnswer(ownerAnswer).stubOnly(),
+            )
+            // `object LocalViewModelStoreOwner { infix fun provides(owner) }`
+            // → JVM instance method `provides(ViewModelStoreOwner)`.
+            val providesMethod = localClass.methods.firstOrNull {
+                it.name == "provides" && it.parameterCount == 1
+            } ?: return null
+            providesMethod.invoke(instance, owner) as? ProvidedValue<*>
+        } catch (_: Throwable) {
+            null  // viewmodel-compose absent — nothing to provide.
+        }
     }
 
     /**

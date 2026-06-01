@@ -34,6 +34,46 @@ private fun userFriendlyMessage(t: Throwable): String {
     val root = generateSequence(t) { it.cause }.lastOrNull() ?: t
     val rootMsg = root.message.orEmpty()
 
+    // Whole-chain text — some DI failures hide the tell-tale phrase in a
+    // wrapper frame rather than the root cause.
+    val chainMsg = generateSequence(t) { it.cause }
+        .joinToString(" | ") { it.message ?: it::class.qualifiedName.orEmpty() }
+
+    if (
+        rootMsg.contains("No ViewModelStoreOwner") ||
+        chainMsg.contains("ViewModelStoreOwner") ||
+        chainMsg.contains("KoinApplication has not been started") ||
+        chainMsg.contains("No Koin Context") ||
+        chainMsg.contains("HiltViewModelFactory") ||
+        chainMsg.contains("hiltViewModel") ||
+        chainMsg.contains("EntryPointAccessors") ||
+        chainMsg.contains("dagger.hilt")
+    ) {
+        return buildString {
+            appendLine("This composable obtains its ViewModel from a DI graph — " +
+                "`koinViewModel()`, `hiltViewModel()`, or `viewModel()` with a custom factory. " +
+                "An isolated preview has no running Koin/Hilt container and no host Activity, " +
+                "so the ViewModel cannot be constructed. (Android Studio's @Preview fails the " +
+                "same way for the same reason.)")
+            appendLine()
+            appendLine("Fix — preview the STATELESS content composable instead of the screen entry. " +
+                "The common pattern (which this screen already follows) splits the UI in two:")
+            appendLine()
+            appendLine("  @Composable")
+            appendLine("  fun XxxScreen(viewModel: XxxViewModel = koinViewModel()) {   // ← not previewable")
+            appendLine("      val state by viewModel.state.collectAsStateWithLifecycle()")
+            appendLine("      XxxContent(state = state, onEvent = viewModel::onEvent)")
+            appendLine("  }")
+            appendLine()
+            appendLine("  @Composable")
+            appendLine("  fun XxxContent(state: UiState, onEvent: (Event) -> Unit) { … }  // ← preview THIS")
+            appendLine()
+            appendLine("Point the preview at `XxxContent` and supply a sample `state`; the plugin " +
+                "auto-mocks the state and callbacks. Alternatively, pass a fake ViewModel " +
+                "constructed with canned data.")
+        }.trim()
+    }
+
     if (rootMsg.contains("LocalContext not present")) {
         return buildString {
             appendLine("Compose Multiplatform Resources (stringResource / painterResource) used " +
