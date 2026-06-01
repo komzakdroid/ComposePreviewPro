@@ -229,6 +229,23 @@ dependencies {
     sampleRuntimeClasspath(project(":sample"))
 }
 
+// Systematic off-device Android native fix: install NativeMethodNeutralizer,
+// load android-all's native-heavy framework classes, assert no
+// UnsatisfiedLinkError + Build.VERSION.SDK_INT is sane.
+//   ./gradlew :renderer:nativeTest
+tasks.register<JavaExec>("nativeTest") {
+    group = "verification"
+    description = "Verify framework-native neutralisation against the bundled android-all runtime"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.composepreviewpro.renderer.NativeNeutralizerTestKt")
+    workingDir = rootDir
+    standardOutput = System.out
+    errorOutput = System.err
+    // Self-attach the JVMTI agent so AgentLoader can hand us Instrumentation.
+    jvmArgs("-Djdk.attach.allowAttachSelf=true", "-XX:+EnableDynamicAgentLoading")
+    useBundledAndroidRuntime()
+}
+
 // Hard-mode render battery through the FULL InteractiveSession path:
 // value-class mangling, deep nesting, complex state, lazy lists, viewModel(),
 // interaction, user CompositionLocals. Renders :sample/StressComposables.kt

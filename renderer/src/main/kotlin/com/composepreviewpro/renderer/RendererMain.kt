@@ -38,6 +38,12 @@ fun main() {
     val instrumentation = AgentLoader.ensureLoaded()
     val agentStatus = if (instrumentation != null) "attached" else "MISSING"
 
+    // Register the framework-native neutraliser BEFORE any render so that the
+    // first time the bundled android-all runtime's classes load (e.g.
+    // android.os.Build via WindowInsets), their `native` methods are already
+    // rewritten to return defaults — no UnsatisfiedLinkError off-device.
+    NativeMethodNeutralizer.installInto(instrumentation)
+
     writer.send(Hello())
     System.err.println("[renderer] up — protocol v1, agent=$agentStatus")
 

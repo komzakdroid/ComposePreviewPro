@@ -47,8 +47,23 @@ public final class SystemProperties {
                 return "14";
             case "ro.build.version.codename":
                 return "REL";
+            // Non-empty codename lists: Build.VERSION.<clinit> does
+            // ALL_CODENAMES[0].equals(...) after getStringList(...) → AIOOBE on
+            // an empty list. "REL" marks a shipped (non-preview) build.
+            case "ro.build.version.all_codenames":
+            case "ro.build.version.known_codenames":
+                return "REL";
             case "ro.product.cpu.abi":
                 return "arm64-v8a";
+            // Non-empty ABI lists: Build.<clinit> does CPU_ABI = SUPPORTED_ABIS[0]
+            // after getStringList(...), which returns an EMPTY array for a blank
+            // property → ArrayIndexOutOfBoundsException. Supply real lists.
+            case "ro.product.cpu.abilist":
+                return "arm64-v8a,armeabi-v7a,armeabi";
+            case "ro.product.cpu.abilist64":
+                return "arm64-v8a";
+            case "ro.product.cpu.abilist32":
+                return "armeabi-v7a,armeabi";
             case "ro.build.version.preview_sdk":
                 return "0";
             default:
